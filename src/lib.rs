@@ -15,3 +15,6 @@ pub mod wk_agent;
 pub mod wk_input;
 #[cfg(target_os = "macos")]
 pub mod wk_native;
+
+#[cfg(target_os = "macos")]
+pub mod browser_mcp;
