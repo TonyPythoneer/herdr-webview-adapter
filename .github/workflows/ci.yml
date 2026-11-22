@@ -1,0 +1,32 @@
+name: adapter-ci
+
+on:
+  push:
+    branches: [main, feature/browser-adapter-initial-port]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-tests:
+    name: portable-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - run: cargo test --all-targets
+
+  macos-native-tests:
+    name: macos-native-tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - run: cargo test --all-targets
