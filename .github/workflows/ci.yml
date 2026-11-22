@@ -2,10 +2,14 @@ name: adapter-ci
 
 on:
   push:
-    branches: [main, feature/browser-adapter-initial-port]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: adapter-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
