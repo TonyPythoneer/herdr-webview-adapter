@@ -9,7 +9,6 @@ use herdr_webview_adapter::{app_home as mods, wk_native};
 #[cfg(target_os = "macos")]
 mod mac {
     use gpui::{prelude::*, *};
-    use raw_window_handle::HasWindowHandle;
     use std::{io::{Read, Write}, net::TcpListener, path::PathBuf,
         sync::mpsc, time::Duration};
 
@@ -105,7 +104,7 @@ mod mac {
                 show:true,focus:true,titlebar:None,
                 ..Default::default()
             },|win,cx|{
-                let parent=win.window_handle().expect("native GPUI window handle");
+                let parent=raw_window_handle::HasWindowHandle::window_handle(win).expect("native GPUI window handle");
                 let native=wry::WebViewBuilder::new().with_url(&url)
                     .build_as_child(&parent).expect("real WKWebView child");
                 let web=cx.new(|cx|gpui_wry::WebView::new(native,win,cx));

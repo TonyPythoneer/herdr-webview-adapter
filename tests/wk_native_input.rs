@@ -7,7 +7,6 @@ use herdr_webview_adapter::wk_input;
 #[cfg(target_os="macos")]
 mod mac {
     use gpui::{prelude::*,*};
-    use raw_window_handle::HasWindowHandle;
     use std::{io::{Read,Write}, net::TcpListener, sync::mpsc, time::{Duration,Instant}};
     use super::wk_input;
     use wry::WebViewExtMacOS;
@@ -202,7 +201,7 @@ document.getElementById('trusted').addEventListener('click',(e)=>{
                     point(px(70.),px(70.)),size(px(360.),px(280.))))),
                 show:true,focus:true,titlebar:None,..Default::default()
             },|win,cx|{
-                let parent=win.window_handle().expect("native GPUI handle");
+                let parent=raw_window_handle::HasWindowHandle::window_handle(win).expect("native GPUI handle");
                 let native=wry::WebViewBuilder::new().with_url(&url)
                     .build_as_child(&parent).expect("Wry WKWebView child");
                 let web=cx.new(|cx|gpui_wry::WebView::new(native,win,cx));
