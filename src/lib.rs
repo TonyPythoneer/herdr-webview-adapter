@@ -19,3 +19,6 @@ pub mod wk_native;
 
 #[cfg(target_os = "macos")]
 pub mod browser_mcp;
+
+#[cfg(target_os = "macos")]
+pub mod browser_job;
