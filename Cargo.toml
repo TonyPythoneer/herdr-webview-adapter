@@ -1,0 +1,32 @@
+[package]
+name = "herdr-webview-adapter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Standalone browser backends and automation adapter for Herdr Desktop"
+publish = false
+
+[dependencies]
+serde_json = "1"
+url = "2"
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.8", features = ["render-to-image"] }
+gpui-wry = "=0.7.2"
+wry = { package = "lb-wry", version = "=0.53.3" }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp"] }
+smallvec = "1"
+libc = "0.2"
+block2 = "=0.6.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSDockTile", "NSResponder", "NSImage", "NSView", "NSWindow", "NSEvent", "NSScreen", "objc2-core-graphics"] }
+objc2-core-foundation = "=0.3.2"
+objc2-core-graphics = "=0.3.2"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString", "NSData", "NSError", "NSGeometry"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["WKWebView", "WKSnapshotConfiguration", "block2", "objc2-app-kit"] }
+
+[profile.dev.package."*"]
+opt-level = 2
