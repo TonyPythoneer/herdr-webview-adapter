@@ -44,6 +44,24 @@ pub fn url_from_props(props: &Value) -> Result<String, String> {
 }
 
 
+#[cfg(target_os = "macos")]
+pub fn create<T: 'static>(
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<T>,
+    url: &str,
+) -> Result<gpui::Entity<gpui_wry::WebView>, String> {
+    use raw_window_handle::HasWindowHandle;
+    use gpui::AppContext as _;
+    let url = normalize_url(url)?;
+    let parent = window.window_handle().map_err(|e| format!("GPUI window handle unavailable: {e}"))?;
+    let native = wry::WebViewBuilder::new()
+        .with_url(&url)
+        .build_as_child(&parent)
+        .map_err(|e| format!("WKWebView creation failed: {e}"))?;
+    Ok(cx.new(|cx| gpui_wry::WebView::new(native, window, cx)))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
