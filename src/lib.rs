@@ -1,6 +1,7 @@
 //! Standalone Rust browser implementation for the Herdr desktop host.
 //! Herdr owns Tab/Pane persistence, native approval authority, and app packaging.
 pub mod app_home;
+pub mod assets;
 pub mod browser;
 pub mod browser_backend;
 #[cfg(target_os = "macos")]
