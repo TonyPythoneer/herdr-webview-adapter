@@ -24,6 +24,10 @@ jobs:
         with:
           toolchain: "1.95.0"
       - run: cargo test --all-targets
+      - name: Upstream compatibility contract and probe unit tests
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_upstream_compat.py' -v
+          python3 scripts/upstream_compat.py gate .github/upstream-compat.json
 
   macos-native-tests:
     name: macos-native-tests
