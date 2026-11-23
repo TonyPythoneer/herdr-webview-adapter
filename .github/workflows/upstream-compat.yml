@@ -1,0 +1,51 @@
+name: adapter-upstream-compat
+on:
+  schedule:
+    - cron: '17 4 * * 1' # Monday 12:17 Asia/Taipei
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: adapter-upstream-compat
+  cancel-in-progress: false
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m unittest discover -s scripts -p 'test_upstream_compat.py' -v
+      - name: Compare latest stable upstream and propose audited compatibility update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r tag object_sha < <(git ls-remote --tags --refs https://github.com/herdrdev/herdr-app.git | python3 scripts/upstream_compat.py select)
+          current="$(python3 -c 'import json; print(json.load(open(".github/upstream-compat.json"))["tag"])')"
+          if [[ "$tag" == "$current" ]]; then echo "Already audited $tag"; exit 0; fi
+          branch="automation/upstream-compat-${tag}-${object_sha:0:12}"
+          if [[ -n "$(git ls-remote --heads origin "refs/heads/$branch")" ]]; then echo "Proposal already exists: $branch"; exit 0; fi
+          upstream="$RUNNER_TEMP/herdr-upstream"
+          mkdir -p "$upstream"
+          git -C "$upstream" init -q
+          git -C "$upstream" remote add origin https://github.com/herdrdev/herdr-app.git
+          git -C "$upstream" fetch --depth=1 --filter=blob:none origin "refs/tags/$tag"
+          commit="$(git -C "$upstream" rev-parse 'FETCH_HEAD^{commit}')"
+          git -C "$upstream" checkout -q FETCH_HEAD -- src/window.rs src/mods.rs src/commands.rs Cargo.toml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          python3 scripts/upstream_compat.py probe --source "$upstream" --tag "$tag" --sha "$commit" > .github/upstream-compat.json
+          git add .github/upstream-compat.json
+          git commit -m "chore(compat): audit upstream $tag"
+          git push origin "HEAD:refs/heads/$branch"
+          compatible="$(python3 -c 'import json; print(json.load(open(".github/upstream-compat.json"))["compatible"])')"
+          gh pr create -R "$GH_REPO" -B main -H "$branch" \
+            -t "chore(compat): review upstream $tag" \
+            -b "Static upstream compatibility report for herdrdev/herdr-app@$tag ($commit). Anchor and GPUI check: $compatible. If incompatible, CI blocks merge until Adapter code is fixed. This does not automatically change the Host; packaged-app E2E is still required."
+          # GITHUB_TOKEN PR creation does not trigger pull_request CI.
+          gh workflow run ci.yml -R "$GH_REPO" --ref "$branch"

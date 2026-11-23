@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+      timezone: Asia/Taipei
+    open-pull-requests-limit: 5
+    groups:
+      compatible-cargo-patches:
+        applies-to: version-updates
+        update-types:
+          - patch
+    # Version changes that disrupt GPUI/WKWebView must fail the compatibility
+    # gate and require a real native-app Host E2E before downstream promotion.
