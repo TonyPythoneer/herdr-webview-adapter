@@ -1,8 +1,9 @@
 {
-  "schema": 1,
+  "schema": 2,
   "repository": "herdrdev/herdr-app",
   "tag": "v0.1.16",
   "sha": "034f8b85f7e6bb71f8ff55cb4a80c548b2578c0f",
+  "tag_object_sha": "034f8b85f7e6bb71f8ff55cb4a80c548b2578c0f",
   "adapter_gpui": "0.3.8",
   "upstream_gpui": "0.3.8",
   "missing_anchors": [],

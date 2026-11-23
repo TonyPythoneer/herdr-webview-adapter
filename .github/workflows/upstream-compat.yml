@@ -25,21 +25,35 @@ jobs:
         run: |
           set -euo pipefail
           read -r tag object_sha < <(git ls-remote --tags --refs https://github.com/herdrdev/herdr-app.git | python3 scripts/upstream_compat.py select)
-          current="$(python3 -c 'import json; print(json.load(open(".github/upstream-compat.json"))["tag"])')"
-          if [[ "$tag" == "$current" ]]; then echo "Already audited $tag"; exit 0; fi
+          read -r current_tag current_object < <(python3 -c 'import json; r=json.load(open(".github/upstream-compat.json")); print(r["tag"],r["tag_object_sha"])')
+          if [[ "$tag" == "$current_tag" ]]; then
+            if [[ "$object_sha" == "$current_object" ]]; then
+              echo "Already audited immutable tag $tag ($object_sha)"
+              exit 0
+            fi
+            echo "::error::Previously audited upstream stable tag $tag MOVED ($current_object -> $object_sha). Refusing silent retag."
+            exit 1
+          fi
           branch="automation/upstream-compat-${tag}-${object_sha:0:12}"
           if [[ -n "$(git ls-remote --heads origin "refs/heads/$branch")" ]]; then echo "Proposal already exists: $branch"; exit 0; fi
           upstream="$RUNNER_TEMP/herdr-upstream"
           mkdir -p "$upstream"
           git -C "$upstream" init -q
           git -C "$upstream" remote add origin https://github.com/herdrdev/herdr-app.git
-          git -C "$upstream" fetch --depth=1 --filter=blob:none origin "refs/tags/$tag"
+          # Fetch by the *already observed immutable object*, never by a
+          # moving tag name; annotated tag objects are peeled only afterwards.
+          git -C "$upstream" fetch --depth=1 --filter=blob:none origin "$object_sha"
+          fetched_object="$(git -C "$upstream" rev-parse FETCH_HEAD)"
+          [[ "$fetched_object" == "$object_sha" ]] || {
+            echo "::error::Fetched upstream object does not match observed tag"
+            exit 1
+          }
           commit="$(git -C "$upstream" rev-parse 'FETCH_HEAD^{commit}')"
           git -C "$upstream" checkout -q FETCH_HEAD -- src/window.rs src/mods.rs src/commands.rs Cargo.toml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -b "$branch"
-          python3 scripts/upstream_compat.py probe --source "$upstream" --tag "$tag" --sha "$commit" > .github/upstream-compat.json
+          python3 scripts/upstream_compat.py probe --source "$upstream" --tag "$tag" --sha "$commit" --tag-object-sha "$object_sha" > .github/upstream-compat.json
           git add .github/upstream-compat.json
           git commit -m "chore(compat): audit upstream $tag"
           git push origin "HEAD:refs/heads/$branch"
