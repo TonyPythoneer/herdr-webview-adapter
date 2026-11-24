@@ -27,52 +27,6 @@ mod mac {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/",listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            // WebKit can preconnect, request the favicon first, or split an
-            // HTTP request line across multiple reads. A single read() is
-            // never a reliable request parser. Keep the fixture bounded and
-            // serve the main document only after an actual GET / request.
-            listener.set_nonblocking(true).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut stream = loop {
-                assert!(Instant::now() < deadline, "WK fixture never received GET /");
-                let (mut conn, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("WK fixture accept failed: {error}"),
-                };
-                conn.set_nonblocking(true).expect("WK fixture must not block on preconnect");
-                let mut request = Vec::new();
-                let request_deadline = Instant::now() + Duration::from_secs(2);
-                while request.len() < 4096 && Instant::now() < request_deadline {
-                    let mut chunk = [0u8; 512];
-                    match conn.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            request.extend_from_slice(&chunk[..n]);
-                            if request.contains(&b'\n') { break; }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(error) => {
-                            eprintln!("WK fixture request read failed: {error}");
-                            break;
-                        }
-                    }
-                }
-                let first_line = String::from_utf8_lossy(&request);
-                let first_line = first_line.lines().next().unwrap_or("").trim_end_matches('\r');
-                if first_line == "GET / HTTP/1.1" {
-                    conn.set_nonblocking(false).unwrap();
-                    break conn;
-                }
-                eprintln!("WK fixture ignored auxiliary/disconnected request: {first_line:?}");
-                let _ = conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            };
             let html = r#"<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
 <body style="margin:0;background:rgb(20,40,60);">
 <div id="tile" style="background:rgb(255,0,0);width:100px;height:100px"></div>
@@ -80,8 +34,65 @@ mod mac {
 <button id="action">Click</button><div id="status">ready</div>
 <script>document.getElementById('action').addEventListener('click',()=> {
  document.getElementById('status').textContent='clicked';});</script>"#;
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",html.len(),html).unwrap();
-            stream.flush().unwrap();
+            // A speculative connection must never hold up the actual document.
+            // Keep serving until the native proof exits; a cancelled navigation
+            // or retry must not consume the only document response.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(25);
+            let mut accepted = 0usize;
+            while Instant::now() < deadline && accepted < 64 {
+                let (mut conn, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("WK fixture accept failed: {error}"),
+                };
+                accepted += 1;
+                std::thread::spawn(move || {
+                    if conn.set_nonblocking(false).is_err()
+                        || conn.set_read_timeout(Some(Duration::from_millis(250))).is_err()
+                        || conn.set_write_timeout(Some(Duration::from_secs(1))).is_err() {
+                        return;
+                    }
+                    let mut request = Vec::new();
+                    let request_deadline = Instant::now() + Duration::from_secs(3);
+                    while request.len() < 8192 && Instant::now() < request_deadline {
+                        let mut chunk = [0u8; 512];
+                        match conn.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                request.extend_from_slice(&chunk[..n]);
+                                if request.windows(4).any(|part| part == b"\r\n\r\n") { break; }
+                            }
+                            Err(error) if matches!(error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted) => continue,
+                            Err(error) => {
+                                eprintln!("WK fixture read failed: {error}");
+                                return;
+                            }
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let first_line = request.lines().next().unwrap_or("");
+                    if !request.contains("\r\n\r\n") {
+                        eprintln!("WK fixture incomplete/disconnected request: {first_line:?}");
+                        return;
+                    }
+                    if first_line == "GET / HTTP/1.1" {
+                        match write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", html.len(), html)
+                            .and_then(|_| conn.flush()) {
+                            Ok(()) => eprintln!("WK fixture served document"),
+                            Err(error) => eprintln!("WK fixture document write failed: {error}"),
+                        }
+                    } else {
+                        let _ = conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                });
+            }
         });
         (url, handle)
     }
@@ -93,7 +104,8 @@ mod mac {
             let _ = window.draw(cx);
         }).map_err(|e|format!("could not draw native WK child: {e}"))?;
         let mut loaded = false;
-        for _ in 0..30 {
+        let load_deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < load_deadline {
             let (tx,rx)=mpsc::channel();
             cx.update(|cx|web.update(cx,|view,_| {
                 view.raw().evaluate_script_with_callback(
