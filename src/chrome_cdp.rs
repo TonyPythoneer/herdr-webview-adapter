@@ -118,6 +118,24 @@ fn wait_for_document_hint(receiver: &Receiver<()>) {
     }
 }
 
+// Avoid a temporary envelope Value and owned method/session strings.
+// Every dynamic value still goes through serde_json's encoder.
+fn encode_command(id: u64, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"{\"id\":");
+    serde_json::to_writer(&mut bytes, &id).map_err(|e| e.to_string())?;
+    bytes.extend_from_slice(b",\"method\":");
+    serde_json::to_writer(&mut bytes, method).map_err(|e| e.to_string())?;
+    bytes.extend_from_slice(b",\"params\":");
+    serde_json::to_writer(&mut bytes, params).map_err(|e| e.to_string())?;
+    if let Some(session) = session {
+        bytes.extend_from_slice(b",\"sessionId\":");
+        serde_json::to_writer(&mut bytes, session).map_err(|e| e.to_string())?;
+    }
+    bytes.extend_from_slice(b"}\0");
+    Ok(bytes)
+}
+
 pub struct Client {
     child: Mutex<Child>,
     writer: Mutex<File>,
@@ -238,12 +256,7 @@ impl Client {
     }
 
     fn write_message(&self, id: u64, method: &str, params: Value, session: Option<&str>) -> Result<(), String> {
-        let mut value = json!({"id":id,"method":method,"params":params});
-        if let Some(session) = session {
-            value["sessionId"] = json!(session);
-        }
-        let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        bytes.push(0);
+        let bytes = encode_command(id, method, &params, session)?;
         self.writer.lock().unwrap().write_all(&bytes)
             .map_err(|e| format!("CDP_DISCONNECTED: {e}"))
     }
@@ -533,6 +546,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn direct_command_encoding_matches_previous_json_and_delimiter() {
+        for session in [None, Some("session-\"\\\0日本語")] {
+            for params in [json!({}), json!({"nested":[null, true, 42, "a\0b\n\"日本語"]}), json!({"data":"x".repeat(1024*1024)})] {
+                let method = "Runtime.evaluate\"\\\0";
+                let mut expected = json!({"id":u64::MAX,"method":method,"params":params.clone()});
+                if let Some(value) = session { expected["sessionId"] = json!(value); }
+                let encoded = encode_command(u64::MAX, method, &params, session).unwrap();
+                assert_eq!(encoded.last(), Some(&0));
+                assert!(!encoded[..encoded.len()-1].contains(&0));
+                assert_eq!(serde_json::from_slice::<Value>(&encoded[..encoded.len()-1]).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn document_ready_hints_are_bounded_and_only_lifecycle_events() {
         assert!(is_document_ready_event("Page.domContentEventFired"));
         assert!(is_document_ready_event("Page.loadEventFired"));
@@ -585,12 +613,22 @@ mod tests {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
-                        let n = connection.read(&mut request).unwrap_or(0);
+                        // TCP may split a request line between reads. Read the
+                        // bounded complete headers, not a single arbitrary chunk.
+                        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut n = 0;
+                        while n < request.len() && !request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            match connection.read(&mut request[n..]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => n += count,
+                            }
+                        }
+                        if !request[..n].windows(4).any(|w| w == b"\r\n\r\n") { continue }
                         // A parser-blocking script keeps readyState at "loading" while
                         // the actual target exists, exercising readiness wakeups.
                         if request[..n].starts_with(b"GET /delayed.js ") {
                             std::thread::sleep(Duration::from_millis(250));
-                            let body = "document.title = 'Herdr delayed fixture';";
+                            let body = "window.__herdrDelayedScriptRan = true; document.title = 'Herdr delayed fixture';";
                             let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                             continue;
                         }
@@ -710,9 +748,19 @@ mod tests {
         drop(pane);
         let delayed = client.open(&format!("http://{address}/delayed"))
             .expect("delayed document must become interactive before screencast");
-        let state = delayed.eval("({title:document.title,ready:document.readyState})").unwrap();
+        let state = delayed.eval("({href:location.href,ready:document.readyState})").unwrap();
+        assert_eq!(state["href"], format!("http://{address}/delayed"));
         assert!(matches!(state["ready"].as_str(), Some("interactive" | "complete")));
-        assert_eq!(state["title"], "Herdr delayed fixture");
+        // The public open contract is an interactive document, not a particular
+        // application title. Independently require that the real delayed script
+        // executes; a missing or misrouted response still fails the test.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = delayed.eval("({title:document.title,ran:window.__herdrDelayedScriptRan===true})").unwrap();
+            if state["ran"] == true && state["title"] == "Herdr delayed fixture" { break }
+            assert!(Instant::now() < deadline, "delayed script did not execute: {state}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(delayed.frame_timeout(Duration::from_secs(10)).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
         drop(delayed);
         drop(client);
