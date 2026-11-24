@@ -89,3 +89,4 @@ jobs:
             -b "Static upstream compatibility report for herdrdev/herdr-app@$tag ($commit). Anchor and GPUI check: $compatible. Any coordinated GPUI dependency changes were resolved before PR creation. This does not automatically change the Host; packaged-app E2E is still required."
           # GITHUB_TOKEN PR creation does not trigger pull_request CI.
           gh workflow run ci.yml -R "$GH_REPO" --ref "$branch"
+          gh workflow run performance.yml -R "$GH_REPO" --ref "$branch"
