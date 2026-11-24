@@ -119,7 +119,7 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
             check(pair["baseline"]["meta"] == pair["candidate"]["meta"], "environment mismatch inside pair")
             if suite == "chrome":
                 version = pair["baseline"]["meta"].get("chrome_version")
-                check(isinstance(version, str) and re.fullmatch(r"(?:Google Chrome )?[0-9]+(?:\\.[0-9]+){1,4}", version) and len(version) <= 64, "invalid Chrome version")
+                check(isinstance(version, str) and re.fullmatch(r"(?:Google Chrome )?[0-9]+(?:[.][0-9]+){1,4}", version) and len(version) <= 64, "invalid Chrome version")
                 browser_versions.add(version)
         for key, samples in sorted(normalized.items()):
             base, cand = samples["baseline"], samples["candidate"]
