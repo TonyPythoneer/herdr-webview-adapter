@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from upstream_compat import ANCHORS, select_tag, probe, gate
+from coordinated_deps import eligible_core, select_wry, rewrite_manifest, host_core, adapter_wry_pin
 
 
 class UpstreamTests(unittest.TestCase):
@@ -53,6 +54,43 @@ class UpstreamTests(unittest.TestCase):
             self.assertEqual(report["sha"], "a" * 40)
             self.assertEqual(report["tag_object_sha"], "b" * 40)
             self.assertTrue(gate(report, manifest.read_text()))
+
+
+
+class CoordinatedDependencyTests(unittest.TestCase):
+    def test_no_upgrade_until_both_upstream_and_host_advance(self):
+        self.assertFalse(eligible_core("0.3.8", "0.3.8", "0.3.8"))
+        self.assertFalse(eligible_core("0.3.8", "0.3.9", "0.3.8"))
+        self.assertFalse(eligible_core("0.3.9", "0.3.8", "0.3.8"))
+        self.assertTrue(eligible_core("0.3.8", "0.3.9", "0.3.9"))
+
+    def test_registry_selection_rejects_incompatible_yanked_and_api_upgrades(self):
+        def record(version, core, yanked=False):
+            return {"vers": version, "yanked": yanked, "deps": [
+                {"name": "gpui", "package": "gpui-pre", "req": core, "kind": "normal"}]}
+        records = [record("0.7.3", "=0.3.9"), record("0.7.4", "=0.3.10"),
+                   record("0.7.5", "=0.3.9", True), record("0.8.0", "=0.3.9"),
+                   record("0.7.6", "^0.3.9"), record("0.7.7-rc.1", "=0.3.9")]
+        self.assertIsNone(select_wry(records, "0.7.2", "0.3.8"))
+        self.assertEqual(select_wry(records, "0.7.2", "0.3.9"), "0.7.3")
+        self.assertEqual(select_wry(records, "0.7.2", "0.3.10"), "0.7.4")
+        self.assertIsNone(select_wry(records, "0.7.4", "0.3.9"))
+
+    def test_manifest_keeps_coupled_types_in_sync(self):
+        manifest = """
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.8" }
+gpui-wry = "=0.7.2"
+wry = { package = "lb-wry", version = "=0.53.3" }
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["test-support"] }
+"""
+        result = rewrite_manifest(manifest, "0.3.9", "0.7.3")
+        self.assertEqual(host_core(result), "0.3.9")
+        self.assertEqual(adapter_wry_pin(result), "0.7.3")
+        self.assertIn('version = "=0.53.3"', result)
+        with self.assertRaises(ValueError):
+            host_core(manifest.replace('version = "=0.3.8", features', 'version = "=0.3.9", features'))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,96 @@
+name: dependabot-automerge
+
+on:
+  workflow_run:
+    workflows: [adapter-ci, adapter-performance]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: '23,53 * * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: write
+
+concurrency:
+  group: dependabot-automerge
+  cancel-in-progress: false
+
+jobs:
+  merge-green:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Privileged workflow: never checkout or execute pull request code.
+      - name: Merge verified green Dependabot PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          numbers="$(gh api --paginate "repos/$GH_REPO/pulls?state=open&base=main&per_page=100" --jq '.[] | select(.user.login == "dependabot[bot]" and .user.id == 49699333) | .number')"
+          for number in $numbers; do
+            pr="$(gh api "repos/$GH_REPO/pulls/$number")"
+            if ! jq -e --arg repo "$GH_REPO" '.state == "open" and .draft == false and .user.login == "dependabot[bot]" and .user.id == 49699333 and .base.ref == "main" and .head.repo.full_name == $repo and .mergeable == true and .mergeable_state == "clean"' <<< "$pr" >/dev/null; then
+              echo "PR #$number: not eligible or mergeability pending"
+              continue
+            fi
+            sha="$(jq -r '.head.sha' <<< "$pr")"
+            base="$(jq -r '.base.sha' <<< "$pr")"
+            # Require the tested head to contain the current base.
+            comparison="$(gh api "repos/$GH_REPO/compare/$base...$sha")"
+            if ! jq -e '.behind_by == 0' <<< "$comparison" >/dev/null; then
+              echo "PR #$number: waiting for Dependabot rebase"
+              continue
+            fi
+            runs="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?event=pull_request&head_sha=$sha&per_page=100")"
+            run="$(jq -c --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha and .event == "pull_request")] | sort_by(.created_at, .id) | last // {}' <<< "$runs")"
+            if ! jq -e '.status == "completed" and .conclusion == "success"' <<< "$run" >/dev/null; then
+              echo "PR #$number: adapter-ci not successful for $sha"
+              continue
+            fi
+            run_id="$(jq -r '.id' <<< "$run")"
+            jobs="$(gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100")"
+            if ! jq -e '[.[].jobs[]] | length > 0 and any(.[]; .name == "portable-tests" and .conclusion == "success") and any(.[]; .name == "macos-native-tests" and .conclusion == "success") and all(.[]; .status == "completed" and .conclusion == "success")' <<< "$jobs" >/dev/null; then
+              echo "PR #$number: expected CI jobs not all successful"
+              continue
+            fi
+            perf_runs="$(gh api "repos/$GH_REPO/actions/workflows/performance.yml/runs?event=pull_request&head_sha=$sha&per_page=100")"
+            perf_run="$(jq -c --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha and .event == "pull_request")] | sort_by(.created_at, .id) | last // {}' <<< "$perf_runs")"
+            if ! jq -e '.status == "completed" and .conclusion == "success"' <<< "$perf_run" >/dev/null; then
+              echo "PR #$number: performance CI not successful for $sha"
+              continue
+            fi
+            perf_id="$(jq -r '.id' <<< "$perf_run")"
+            perf_jobs="$(gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$perf_id/jobs?filter=latest&per_page=100")"
+            if ! jq -e '[.[].jobs[]] | length > 0 and any(.[]; .name == "performance-portable" and .conclusion == "success") and any(.[]; .name == "performance-native" and .conclusion == "success") and all(.[]; .status == "completed" and .conclusion == "success")' <<< "$perf_jobs" >/dev/null; then
+              echo "PR #$number: expected performance jobs not all successful"
+              continue
+            fi
+            rollup="$(gh pr view "$number" --json headRefOid,statusCheckRollup)"
+            if ! jq -e --arg sha "$sha" '.headRefOid == $sha and (.statusCheckRollup | length > 0 and all(.[]; (.status == "COMPLETED" and .conclusion == "SUCCESS") or .state == "SUCCESS"))' <<< "$rollup" >/dev/null; then
+              echo "PR #$number: another check is pending or unsuccessful"
+              continue
+            fi
+            # Recheck the base and head immediately before the SHA-guarded merge.
+            fresh="$(gh api "repos/$GH_REPO/pulls/$number")"
+            if ! jq -e --arg sha "$sha" --arg base "$base" '.state == "open" and .draft == false and .head.sha == $sha and .base.sha == $base and .mergeable_state == "clean"' <<< "$fresh" >/dev/null; then
+              echo "PR #$number: changed during verification"
+              continue
+            fi
+            if [[ "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" != "$base" ]]; then
+              echo "PR #$number: main advanced during verification"
+              continue
+            fi
+            result="$(gh api --method PUT "repos/$GH_REPO/pulls/$number/merge" -f sha="$sha" -f merge_method=squash)"
+            jq -e '.merged == true' <<< "$result" >/dev/null
+            echo "Merged Dependabot PR #$number ($sha)"
+            # Token-generated pushes do not trigger normal push CI.
+            gh workflow run ci.yml --ref main
+            gh workflow run performance.yml --ref main
+          done
