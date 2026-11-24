@@ -16,7 +16,9 @@ updates:
     # Version changes that disrupt GPUI/WKWebView must fail the compatibility
     # gate and require a real native-app Host E2E before downstream promotion.
     # These exact pins form the Host/Adapter GPUI type compatibility boundary.
-    # Upgrade them together in an audited maintainer PR after Host migration.
+    # upstream-compat.yml owns coordinated version updates after Host migration.
+    # Keep Dependabot alerts enabled; security fixes that require a core migration
+    # and any lb-wry/API changes outside the supported patch series need review.
     ignore:
       - dependency-name: gpui-pre
       - dependency-name: gpui-pre-platform
