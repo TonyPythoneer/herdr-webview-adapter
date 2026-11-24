@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
-    os::{fd::{FromRawFd, RawFd}, unix::{fs::PermissionsExt, process::CommandExt}},
+    os::{fd::{FromRawFd, RawFd}, unix::{fs::{MetadataExt, PermissionsExt}, process::CommandExt}},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -29,6 +29,56 @@ pub struct ChromeBinary {
     pub version: String,
 }
 
+// Availability::current and shared_client commonly probe the same binary
+// back-to-back. Reuse only a successful, very recent version check and only
+// while the exact executable identity is unchanged. Never cache a miss.
+const DISCOVERY_TTL: Duration = Duration::from_secs(5);
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExecutableIdentity {
+    dev: u64, ino: u64, size: u64, mode: u32,
+    mtime: i64, mtime_nsec: i64, ctime: i64, ctime_nsec: i64,
+}
+impl ExecutableIdentity {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self { dev: meta.dev(), ino: meta.ino(), size: meta.size(), mode: meta.mode(),
+            mtime: meta.mtime(), mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(), ctime_nsec: meta.ctime_nsec() }
+    }
+}
+struct DiscoveryEntry {
+    binary: ChromeBinary,
+    identity: ExecutableIdentity,
+    checked: Instant,
+}
+static DISCOVERY: OnceLock<Mutex<Option<DiscoveryEntry>>> = OnceLock::new();
+
+fn discover_candidate(
+    path: &Path, cache: &Mutex<Option<DiscoveryEntry>>,
+    probe: impl FnOnce(&Path) -> Option<String>,
+) -> Option<ChromeBinary> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 { return None }
+    let identity = ExecutableIdentity::of(&meta);
+    {
+        let cached = cache.lock().unwrap();
+        if let Some(entry) = cached.as_ref()
+            && entry.binary.path == path && entry.identity == identity
+            && entry.checked.elapsed() < DISCOVERY_TTL
+        {
+            return Some(entry.binary.clone());
+        }
+    }
+    // Do not hold the global mutex while starting a subprocess.
+    let version = probe(path)?;
+    if !chrome_major(&version).is_some_and(|major| major >= 136) { return None }
+    if ExecutableIdentity::of(&fs::metadata(path).ok()?) != identity { return None }
+    let binary = ChromeBinary { path: path.to_owned(), version };
+    *cache.lock().unwrap() = Some(DiscoveryEntry {
+        binary: binary.clone(), identity, checked: Instant::now(),
+    });
+    Some(binary)
+}
+
 /// Discover only the user's installed Chrome, never an automated download.
 /// HERDR_CHROME_BINARY is an explicit override intended for managed macOS
 /// installations and CI; it must still be a usable executable.
@@ -41,17 +91,12 @@ pub fn discover() -> Result<ChromeBinary, String> {
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home).join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"));
     }
+    let cache = DISCOVERY.get_or_init(|| Mutex::new(None));
     for path in candidates {
-        let Ok(meta) = fs::metadata(&path) else { continue };
-        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
-            continue;
-        }
-        let Ok(output) = Command::new(&path).arg("--version").output() else { continue };
-        if !output.status.success() { continue; }
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if chrome_major(&version).is_some_and(|major| major >= 136) {
-            return Ok(ChromeBinary { path, version });
-        }
+        if let Some(binary) = discover_candidate(&path, cache, |path| {
+            let output = Command::new(path).arg("--version").output().ok()?;
+            output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }) { return Ok(binary); }
     }
     Err("CHROME_NOT_INSTALLED: install Google Chrome 136+ (stable) in /Applications, or set HERDR_CHROME_BINARY to its executable".into())
 }
@@ -533,6 +578,28 @@ pub fn persistent_profile() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_reuses_only_recent_success_for_same_executable() {
+        let root = std::env::temp_dir().join(format!("herdr-discovery-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("chrome");
+        fs::write(&path, b"first").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = Mutex::new(None);
+        assert!(discover_candidate(&path, &cache, |_| None).is_none());
+        assert!(discover_candidate(&path, &cache, |_| Some("Google Chrome 135.0".into())).is_none());
+        assert!(discover_candidate(&path, &cache, |_| Some("Google Chrome 158.0".into())).is_some());
+        assert_eq!(discover_candidate(&path, &cache, |_| panic!("cache miss")).unwrap().version, "Google Chrome 158.0");
+        cache.lock().unwrap().as_mut().unwrap().checked = Instant::now() - DISCOVERY_TTL;
+        assert_eq!(discover_candidate(&path, &cache, |_| Some("Google Chrome 159.0".into())).unwrap().version, "Google Chrome 159.0");
+        fs::write(&path, b"changed executable bytes").unwrap();
+        assert_eq!(discover_candidate(&path, &cache, |_| Some("Google Chrome 160.0".into())).unwrap().version, "Google Chrome 160.0");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(discover_candidate(&path, &cache, |_| panic!("not executable")).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn document_ready_hints_are_bounded_and_only_lifecycle_events() {

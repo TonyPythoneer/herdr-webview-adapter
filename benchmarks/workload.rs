@@ -145,11 +145,27 @@ fn profile_chrome(operation: &str) {
     println!("PROFILE_RESULT {}", json!({"operations":count,"elapsed_ms":start.elapsed().as_secs_f64()*1000.0}));
 }
 
+// Separate process, outside timed browser runs: measure the version probe
+// that Availability::current and shared_client perform back-to-back.
+#[cfg(target_os="macos")]
+fn discovery() {
+    use herdr_webview_adapter::chrome_cdp::discover;
+    let first = sample("chrome_discovery_cold", || discover().unwrap());
+    for _ in 0..4 {
+        let repeat = sample("chrome_discovery_repeat", || discover().unwrap());
+        assert_eq!(first.path, repeat.path);
+        assert_eq!(first.version, repeat.version);
+    }
+    println!("PERF_META {}", json!({"chrome_version":first.version}));
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("portable") => portable(),
         #[cfg(target_os="macos")]
         Some("chrome") => chrome(),
+        #[cfg(target_os="macos")]
+        Some("discovery") => discovery(),
         #[cfg(target_os="macos")]
         Some("profile_chrome") => profile_chrome(&std::env::args().nth(2).expect("profile operation")),
         _ => panic!("unknown benchmark suite"),

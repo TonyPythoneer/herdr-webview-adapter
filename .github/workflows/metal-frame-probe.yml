@@ -1,0 +1,39 @@
+name: adapter-metal-frame-probe
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'benchmarks/metal_swizzle.swift'
+      - 'scripts/metal_probe_report.py'
+      - '.github/workflows/metal-frame-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: metal-frame-probe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  experiment:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Run independent experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe-report
+          git rev-parse HEAD > probe-report/revision.txt
+          sw_vers > probe-report/environment.txt
+          swiftc -O benchmarks/metal_swizzle.swift -o "$RUNNER_TEMP/metal-swizzle"
+          "$RUNNER_TEMP/metal-swizzle" | tee probe-report/metal.jsonl
+          python3 scripts/metal_probe_report.py probe-report/metal.jsonl probe-report/metal.json | tee probe-report/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-frame-probe-${{ github.run_attempt }}
+          path: probe-report/
+          if-no-files-found: warn
+          retention-days: 30
