@@ -233,6 +233,7 @@ def main():
     native=args.suite=="native"
     head=run("git","rev-parse","HEAD")
     data={"schema":1,"baseline_sha":BASELINE,"candidate_sha":head,"status":"failed","comparison":{},"rounds":{},"errors":[],
+          "context":{"run_id":os.getenv("GITHUB_RUN_ID"),"run_attempt":os.getenv("GITHUB_RUN_ATTEMPT"),"event":os.getenv("GITHUB_EVENT_NAME"),"suite":args.suite,"pr_head_sha":os.getenv("PERF_PR_HEAD_SHA"),"pr_base_sha":os.getenv("PERF_PR_BASE_SHA")},
           "environment":{"platform":platform.platform(),"machine":platform.machine(),"cpu_count":os.cpu_count(),"runner_image":os.getenv("ImageVersion"),"runner_os":os.getenv("RUNNER_OS"),"rust":run("rustc","-Vv"),"cargo":run("cargo","-V")},
           "workload_sha256":{p.name:digest(p) for p in (ROOT/"benchmarks").glob("*.rs")},"lock_sha256":{}}
     if native:
