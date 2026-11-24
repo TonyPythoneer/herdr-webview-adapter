@@ -417,17 +417,61 @@ impl Client {
 }
 
 
-static SHARED_CHROME: OnceLock<Mutex<Weak<Client>>> = OnceLock::new();
+#[derive(Default)]
+struct SharedChrome {
+    weak: Weak<Client>,
+    // Opt-in experimental lease; never retain multiple browser processes.
+    retained: Option<Arc<Client>>,
+}
+static SHARED_CHROME: OnceLock<Mutex<SharedChrome>> = OnceLock::new();
+
+fn retain_experiment(lock: &'static Mutex<SharedChrome>, client: &Arc<Client>, shared: &mut SharedChrome) {
+    if std::env::var_os("HERDR_EXPERIMENT_CHROME_RETENTION").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    shared.retained = Some(client.clone());
+    let weak = Arc::downgrade(client);
+    // One worker per retained browser, no per-pane timers. The lock serializes
+    // expiry with new acquisitions; never drop the last lease outside it.
+    if std::thread::Builder::new().name("herdr-chrome-idle-lease".into()).spawn(move || {
+        let mut idle_since: Option<Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let Ok(mut state) = lock.lock() else {return};
+            let Some(retained) = state.retained.as_ref() else {return};
+            if !Weak::ptr_eq(&weak, &Arc::downgrade(retained)) {return}
+            if Arc::strong_count(retained) == 1 {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(5) {
+                    state.retained = None;
+                    return;
+                }
+            } else {idle_since = None;}
+        }
+    }).is_err() { shared.retained = None; }
+}
+
 
 /// All Chrome panes share one headless Chrome process and a private profile.
 /// The mutex prevents concurrent pane creation from racing on the profile lock.
 pub fn shared_client() -> Result<Arc<Client>, String> {
-    let lock = SHARED_CHROME.get_or_init(|| Mutex::new(Weak::new()));
+    let lock = SHARED_CHROME.get_or_init(|| Mutex::new(SharedChrome::default()));
     let mut shared = lock.lock().unwrap();
-    if let Some(client) = shared.upgrade() { return Ok(client); }
+    if let Some(client) = shared.weak.upgrade() {
+        // A dead retained browser must not be handed to a newly opened pane.
+        let alive = client.child.lock().map_err(|_| "Chrome child lock poisoned")?
+            .try_wait().map_err(|e| e.to_string())?.is_none();
+        if alive { return Ok(client); }
+        shared.retained = None;
+        if Arc::strong_count(&client) != 1 {
+            return Err("CDP_DISCONNECTED: close existing Chrome panes before retry".into());
+        }
+        drop(client);
+    }
     let chrome = discover()?;
     let client = Client::start(&chrome, &persistent_profile())?;
-    *shared = Arc::downgrade(&client);
+    shared.weak = Arc::downgrade(&client);
+    retain_experiment(lock, &client, &mut shared);
     Ok(client)
 }
 
