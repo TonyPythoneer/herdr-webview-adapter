@@ -2,9 +2,9 @@
 
 Immutable pre-redesign commit: `acf81de1738bf6ef2e4f6194208eb268e7523842`.
 
-Every PR and main push runs the same release-mode workload against the pinned baseline and exact candidate SHA on one runner per suite. Five fresh paired process runs alternate order. Portable batches warm up before collection; native runs use fresh isolated profiles and real local fixture pages. No external websites. Both revisions compile the exact same harness and fixed copies of the existing native smoke fixtures (pixel fixture uses bounded HTTP parsing and explicit fail-closed completion). Changing benchmarks requires an explicit review and remeasurement on both revisions.
+Every PR and main push runs the same release-mode workload against the pinned baseline and exact candidate SHA on one runner per suite. Five fresh paired process runs alternate order; PR events additionally measure the exact PR base in balanced three-way rounds. Portable batches warm up before collection; native runs use fresh isolated profiles and real local fixture pages. No external websites. All measured revisions compile the exact same harness and fixed copies of the existing native smoke fixtures (pixel fixture uses bounded HTTP parsing and explicit fail-closed completion). Changing benchmarks requires an explicit review and remeasurement on both revisions.
 
-Reports: GitHub Actions job summary, artifact performance.md, raw performance.json, per-run logs, and both resolved Cargo.lock files. A missing workload, failure, browser mismatch, missing Chrome or incomplete sample count fails the measurement. No performance threshold is an automatic release approval; the first PR measures A/A-equivalent production code to learn noise, not an improvement. A consistent 15% paired median difference is a screening signal; repeat on controlled hardware before claiming smaller gains or setting regression budgets. Never trade away existing correctness or security gates.
+Reports: GitHub Actions job summary, artifact performance.md, raw performance.json, per-run logs, and all resolved Cargo.lock files. A missing workload, failure, browser mismatch, missing Chrome or incomplete sample count fails the measurement. No performance threshold is an automatic release approval; the first PR measures A/A-equivalent production code to learn noise, not an improvement. A consistent 15% paired median difference is a screening signal; repeat on controlled hardware before claiming smaller gains or setting regression budgets. Never trade away existing correctness or security gates.
 
 Portable measures URL and engine policy batches, not host dispatch. Native measures actual Chrome startup, session, query, eval, click-to-DOM, screenshot, frame receive and confirmed close; plus actual WK pixel and trusted input smoke workload wall times. Sampled RSS and CPU accounting have limitations documented in the report. GPUI host/main-thread, presentation, and precise WK process CPU/RSS require a later host-level harness.
 
@@ -26,7 +26,7 @@ The default-branch `adapter-benchmark-feedback` workflow consumes completed
 `adapter-performance` runs. No benchmark rerun or additional native runner is
 required to generate feedback. It publishes one bot-owned, updateable PR
 comment and uploads `benchmark-feedback.json` (schema
-`herdr.performance-feedback/v1`) and `benchmark-feedback.md`. Push runs also
+`herdr.performance-feedback/v2`) and `benchmark-feedback.md`. Push runs also
 produce an artifact. Replay a completed run with **Run workflow** on main,
 passing its numeric source run ID. Runs predating provenance fields are
 reported as unavailable evidence, not fabricated results.
@@ -57,9 +57,30 @@ feedback. Forks retain their original unprivileged artifacts.
    instead of claiming success. No automatic self-modifying code or merge
    based solely on benchmark feedback.
 
-The existing five-pair immutable reference measures cumulative evolution, not
-the isolated effect of the newest PR. For causal attribution, reproduce the
-chosen metric against the PR base under identical workload, lock and runner
-conditions before claiming incremental improvement; the next benchmark
-extension should add an explicit same-run PR-base comparison without removing
-the fixed baseline. Do not subtract historical percentages from different runs.
+## Phase 4 — Incremental comparison
+
+PR-triggered runs verify that the checked-out synthetic merge commit has the exact
+event base and head as its two parents. Build the immutable baseline, exact PR
+base and candidate under the same fixed workload, on the same runner, using five
+balanced rounds. Candidate execution is shared by both comparisons: 15 process
+runs per workload rather than 20 for two independent five-pair experiments.
+This adds one revision build and five process runs over the original cumulative
+measurement. When both reference SHAs are identical, reuse the reference build
+and observations as well. No extra native reporting runner is needed.
+
+Raw report schema 2 includes `incremental_reference_sha`, `round_order`,
+`rounds.*[].pr_base`, `incremental_comparison` and the PR-base lock hash.
+Feedback schema v2 preserves the existing cumulative metrics and adds
+`incremental.status`, `incremental.reference_shas`, `incremental.signals`,
+`suites.*.incremental_metrics` and `decision_scope`. Old schema-1 artifacts
+remain readable, but their incremental status is unavailable. Push and plain
+workflow-dispatch runs are cumulative only. A failed or missing reference never
+becomes a zero delta or a complete incremental report.
+
+AI prioritizes verified incremental regressions over historical cumulative
+signals. Read the PR-base/candidate lock hashes before attributing a change to
+code. An uncommitted lock is reused only when manifests match byte-for-byte,
+preferring the PR base for the candidate; committed locks are preserved.
+Same-run pairing controls some runner variation but is still a screening
+measurement, not statistical proof. Do not subtract historical percentages
+from different runs. Confirm significant findings on controlled hardware.

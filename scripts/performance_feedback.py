@@ -72,7 +72,7 @@ def metric_owner(key):
         return ["src/wk_input.rs", "src/wk_agent.rs"]
     return ["src/wk_native.rs"]
 
-def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
+def _normalize_pairwise(data, matrix_suite, run_id, attempt, event, head):
     check(isinstance(data, dict) and data.get("schema") == 1, "unknown source schema")
     context = data.get("context")
     check(isinstance(context, dict), "missing run provenance")
@@ -161,21 +161,100 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
             "environment": safe_env, "environment_source": "original performance.json; free text intentionally not copied",
             "reported_error_count": len(data["errors"]) if isinstance(data.get("errors"), list) else None}
 
+def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
+    """Validate both comparisons against the same measured candidate samples."""
+    check(isinstance(data, dict) and data.get("schema") in (1, 2), "unknown source schema")
+    if data["schema"] == 1:
+        result = _normalize_pairwise(data, matrix_suite, run_id, attempt, event, head)
+        result["incremental_status"] = "unavailable" if event == "pull_request" else "not_applicable"
+        result["incremental_metrics"] = []
+        return result
+    reference = data.get("incremental_reference_sha")
+    context = data.get("context", {})
+    check(isinstance(context, dict), "missing run provenance")
+    if event == "pull_request":
+        check(sha(reference) and reference == context.get("pr_base_sha"), "invalid incremental reference")
+    else:
+        check(reference is None, "unexpected incremental reference")
+    rounds = data.get("rounds")
+    orders = data.get("round_order")
+    check(isinstance(rounds, dict) and isinstance(orders, dict) and set(rounds) == set(orders), "missing round order")
+    expected_sides = {"baseline", "candidate", "pr_base"} if reference else {"baseline", "candidate"}
+    lock_hashes = data.get("lock_sha256", {})
+    check(isinstance(lock_hashes, dict) and set(lock_hashes) <= expected_sides
+          and all(digest(v) for v in lock_hashes.values()), "invalid lock hashes")
+    if data.get("status") == "measured":
+        check(set(lock_hashes) == expected_sides, "missing comparison lock")
+    if reference == BASELINE:
+        check(lock_hashes.get("pr_base") == lock_hashes.get("baseline"), "shared reference lock mismatch")
+    cumulative, incremental = {}, {}
+    for workload, pairs in rounds.items():
+        check(isinstance(pairs, list) and isinstance(orders[workload], list)
+              and len(orders[workload]) == len(pairs) <= PAIRS, "invalid round order length")
+        cumulative[workload] = []
+        incremental[workload] = []
+        for i, pair in enumerate(pairs):
+            check(isinstance(pair, dict) and set(pair) == expected_sides, "invalid comparison sides")
+            order = orders[workload][i]
+            if reference and reference != BASELINE:
+                expected_order = (("baseline", "pr_base", "candidate"),
+                                  ("candidate", "baseline", "pr_base"),
+                                  ("pr_base", "candidate", "baseline"),
+                                  ("candidate", "pr_base", "baseline"),
+                                  ("baseline", "candidate", "pr_base"))[i]
+            else:
+                expected_order = ("baseline", "candidate") if i % 2 == 0 else ("candidate", "baseline")
+            check(order == list(expected_order), "unexpected measurement order")
+            cumulative[workload].append({"baseline": pair["baseline"], "candidate": pair["candidate"]})
+            if reference:
+                if reference == BASELINE:
+                    check(pair["pr_base"] == pair["baseline"], "shared reference observations differ")
+                incremental[workload].append({"baseline": pair["pr_base"], "candidate": pair["candidate"]})
+    def normalize(rounds, lock_reference):
+        # Reuse the exact same strict sample validation and screening calculation.
+        locks = {k: lock_hashes[v] for k, v in (("baseline", lock_reference), ("candidate", "candidate")) if v in lock_hashes}
+        return _normalize_pairwise(dict(data, schema=1, rounds=rounds, lock_sha256=locks),
+                                   matrix_suite, run_id, attempt, event, head)
+    result = normalize(cumulative, "baseline")
+    result["lock_sha256"] = lock_hashes
+    result["incremental_reference_sha"] = reference
+    result["incremental_status"] = "not_applicable"
+    result["incremental_metrics"] = []
+    result["round_order"] = orders
+    if reference:
+        inc = normalize(incremental, "pr_base")
+        result["incremental_status"] = "complete" if inc["status"] == "measured" else "partial_or_failed"
+        result["incremental_metrics"] = inc["metrics"]
+    return result
+
+def signal_counts(rows):
+    return {k: sum(r["signal"] == k for r in rows) for k in ("regression_signal", "improvement_signal", "inconclusive")}
+
 def assemble(run, suites, problems, pr_number=None):
     complete = (run["conclusion"] == "success" and set(suites) == set(SUITES)
                 and not problems and all(s["status"] == "measured" for s in suites.values()))
     rows = [row for s in suites.values() for row in s["metrics"]]
-    signals = {k: sum(r["signal"] == k for r in rows) for k in ("regression_signal", "improvement_signal", "inconclusive")}
-    regressions = sorted((r for r in rows if r["signal"] == "regression_signal"), key=lambda r: -r["paired_delta_pct"])
+    signals = signal_counts(rows)
+    incremental_rows = [row for s in suites.values() for row in s.get("incremental_metrics", [])]
+    incremental_complete = (complete and run["event"] == "pull_request"
+                            and all(s.get("incremental_status") == "complete" for s in suites.values()))
+    incremental_status = ("not_applicable" if run["event"] != "pull_request" else
+                          "complete" if incremental_complete else "unavailable_or_partial")
+    # Use direct PR-base evidence for current changes; cumulative signals are
+    # historical context, never attributed to the current PR.
+    decision_rows = incremental_rows if incremental_complete else rows
+    scope = "incremental" if incremental_complete else "cumulative"
+    regressions = sorted((r for r in decision_rows if r["signal"] == "regression_signal"), key=lambda r: -r["paired_delta_pct"])
     priorities = []
     if not complete:
         priorities.append({"priority": "P0", "action": "restore complete verified benchmark coverage; inspect original CI jobs/logs", "reason": "failed_or_partial_measurement"})
-    if any(s["lock_sha256"].get("baseline") != s["lock_sha256"].get("candidate") for s in suites.values()):
+    lock_reference = "pr_base" if incremental_complete else "baseline"
+    if any(s["lock_sha256"].get(lock_reference) != s["lock_sha256"].get("candidate") for s in suites.values()):
         priorities.append({"priority": "P1", "action": "isolate dependency changes before attributing latency changes to code", "reason": "dependency_resolution_differs"})
     for row in regressions:
-        priorities.append({"priority": "P1", "metric": row["metric"], "paired_delta_pct": row["paired_delta_pct"],
+        priorities.append({"priority": "P1", "scope": scope, "metric": row["metric"], "paired_delta_pct": row["paired_delta_pct"],
                            "source_candidates": row["source_candidates"],
-                           "action": "reproduce against PR base with matching locks; profile this path before proposing a code change"})
+                           "action": ("reproduce the incremental regression with matching locks; profile before proposing a change" if incremental_complete else "reproduce against PR base with matching locks; cumulative signal is not attributable to this PR")})
     if complete and not regressions:
         # Rank only instrumented operation costs within Chrome, not unrelated
         # wall/CPU/RSS counters or incomparable portable batch sizes.
@@ -189,7 +268,7 @@ def assemble(run, suites, problems, pr_number=None):
         if not hotspots:
             priorities.append({"priority": "P2", "action": "choose the next hypothesis from workload cost and profile evidence; do not optimize inconclusive deltas"})
     candidates = sorted({s["candidate_sha"] for s in suites.values()})
-    return {"schema": "herdr.performance-feedback/v1", "status": "complete" if complete else "partial_or_failed",
+    return {"schema": "herdr.performance-feedback/v2", "status": "complete" if complete else "partial_or_failed",
             "run": {k: run[k] for k in ("id", "run_attempt", "head_sha", "event", "conclusion")},
             "pr_number": pr_number, "baseline_sha": BASELINE, "candidate_shas": candidates,
             "pr_base_shas": sorted({s["pr_base_sha"] for s in suites.values() if s["pr_base_sha"]}),
@@ -198,7 +277,8 @@ def assemble(run, suites, problems, pr_number=None):
                        "delta": "median of paired process-median percentage changes",
                        "tail_percentiles": "descriptive; not a confidence interval"},
             "coverage": {s: suites[s]["completed_pairs"] if s in suites else None for s in SUITES},
-            "signals": signals, "problems": problems, "suites": suites, "next_actions": priorities,
+            "signals": signals, "incremental": {"status": incremental_status, "reference_shas": sorted({s["incremental_reference_sha"] for s in suites.values() if s.get("incremental_reference_sha")}), "signals": signal_counts(incremental_rows)},
+            "decision_scope": scope, "problems": problems, "suites": suites, "next_actions": priorities,
             "limitations": ["No full host presentation, GPUI main-thread or input-to-display latency.",
                             "Sampled RSS and CPU include harness/accounting limitations.",
                             "Do not compare across runner environments or workload hashes.",
@@ -225,6 +305,22 @@ def render_comment(report, repo, reporter_id):
     for row in rows[:12]:
         delta = "N/A" if row["paired_delta_pct"] is None else f"{row['paired_delta_pct']:+.1f}%"
         lines.append(f"| `{row['metric']}` | {row['unit']} | {row['baseline']['p50']:.4g} | {row['candidate']['p50']:.4g} | {delta} | {row['signal'].replace('_',' ')} |")
+    inc = report["incremental"]
+    lines += ["", "### Incremental comparison (PR base vs candidate)", "",
+              f"Status: **{inc['status'].replace('_', ' ')}**"]
+    if inc["reference_shas"]:
+        lines.append("PR base: " + ", ".join("`" + s[:12] + "`" for s in inc["reference_shas"]))
+    if inc["status"] == "complete":
+        sig = inc["signals"]
+        lines += [f"Signals: **{sig['regression_signal']} regression**, **{sig['improvement_signal']} improvement**, {sig['inconclusive']} inconclusive.",
+                  "", "| Metric | Unit | PR base p50 | Candidate p50 | Paired delta | Signal |", "|---|---|---:|---:|---:|---|"]
+        inc_rows = [row for s in report["suites"].values() for row in s.get("incremental_metrics", [])]
+        inc_rows.sort(key=lambda row: ({"regression_signal": 0, "improvement_signal": 1, "inconclusive": 2}[row["signal"]], -abs(row["paired_delta_pct"] or 0)))
+        for row in inc_rows[:12]:
+            delta = "N/A" if row["paired_delta_pct"] is None else f"{row['paired_delta_pct']:+.1f}%"
+            lines.append(f"| `{row['metric']}` | {row['unit']} | {row['baseline']['p50']:.4g} | {row['candidate']['p50']:.4g} | {delta} | {row['signal'].replace('_',' ')} |")
+    else:
+        lines.append("No complete direct comparison; do not infer incremental PR impact.")
     lines += ["", "### Next engineering actions"]
     for a in report["next_actions"][:6]:
         lines.append(f"- **{a['priority']}** " + (f"`{a['metric']}`: " if "metric" in a else "") + a["action"] + (" (" + ", ".join("`"+p+"`" for p in a["source_candidates"]) + ")" if "source_candidates" in a else ""))

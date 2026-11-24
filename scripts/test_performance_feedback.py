@@ -1,4 +1,5 @@
 import io
+import copy
 import json
 import tempfile
 from pathlib import Path
@@ -104,6 +105,89 @@ class FeedbackTests(unittest.TestCase):
             z.writestr("other.json", "{}")
         with self.assertRaises(ValueError):
             f.read_zip(buf.getvalue())
+
+
+def incremental_fixture(matrix, ratio=1.2, base_ratio=1.0, reference=BASE):
+    data = fixture(matrix, ratio)
+    data["schema"] = 2
+    data["incremental_reference_sha"] = reference
+    data["context"]["pr_base_sha"] = reference
+    data["lock_sha256"]["pr_base"] = data["lock_sha256"]["baseline"]
+    data["round_order"] = {}
+    for workload, pairs in data["rounds"].items():
+        data["round_order"][workload] = []
+        for i, pair in enumerate(pairs):
+            pair["pr_base"] = copy.deepcopy(pair["baseline"])
+            for key, samples in pair["pr_base"]["samples"].items():
+                pair["pr_base"]["samples"][key] = [x * base_ratio for x in samples]
+            order = (("baseline", "pr_base", "candidate"),
+                     ("candidate", "baseline", "pr_base"),
+                     ("pr_base", "candidate", "baseline"),
+                     ("candidate", "pr_base", "baseline"),
+                     ("baseline", "candidate", "pr_base"))[i] if reference != f.BASELINE else (
+                         ("baseline", "candidate") if i % 2 == 0 else ("candidate", "baseline"))
+            data["round_order"][workload].append(list(order))
+    return data
+
+class IncrementalTests(unittest.TestCase):
+    def test_cumulative_regression_but_incremental_improvement(self):
+        suites = {s: norm(incremental_fixture(s, 1.2, 1.5), s) for s in f.SUITES}
+        report = f.assemble(RUN, suites, [], 7)
+        self.assertEqual(report["schema"], "herdr.performance-feedback/v2")
+        self.assertEqual(report["incremental"]["status"], "complete")
+        self.assertEqual(report["decision_scope"], "incremental")
+        self.assertGreater(report["signals"]["regression_signal"], 0)
+        self.assertGreater(report["incremental"]["signals"]["improvement_signal"], 0)
+        self.assertFalse(any(a.get("scope") == "incremental" and a.get("priority") == "P1" for a in report["next_actions"]))
+        row = suites["portable"]["incremental_metrics"][0]
+        self.assertAlmostEqual(row["paired_delta_pct"], -20)
+        self.assertEqual(row["raw_samples_by_pair"]["candidate"], suites["portable"]["metrics"][0]["raw_samples_by_pair"]["candidate"])
+        self.assertIn("Incremental comparison", f.render_comment(report, REPO, 99))
+
+    def test_incremental_regression_despite_cumulative_improvement(self):
+        suites = {s: norm(incremental_fixture(s, .8, .6), s) for s in f.SUITES}
+        report = f.assemble(RUN, suites, [])
+        self.assertGreater(report["signals"]["improvement_signal"], 0)
+        self.assertGreater(report["incremental"]["signals"]["regression_signal"], 0)
+        self.assertEqual(report["next_actions"][0]["scope"], "incremental")
+
+    def test_legacy_and_partial_not_incremental_complete(self):
+        self.assertEqual(norm(fixture("portable"), "portable")["incremental_status"], "unavailable")
+        data = incremental_fixture("portable")
+        data["status"] = "failed"
+        data["rounds"]["portable"].pop()
+        data["round_order"]["portable"].pop()
+        report = f.assemble(dict(RUN, conclusion="failure"), {"portable": norm(data, "portable")}, [])
+        self.assertEqual(report["incremental"]["status"], "unavailable_or_partial")
+        self.assertEqual(report["next_actions"][0]["priority"], "P0")
+
+    def test_reject_reference_order_and_missing_base(self):
+        for mutate in [
+            lambda d: d.update(incremental_reference_sha=HEAD),
+            lambda d: d["round_order"]["portable"][0].reverse(),
+            lambda d: d["rounds"]["portable"][0].pop("pr_base"),
+            lambda d: d["lock_sha256"].pop("pr_base"),
+        ]:
+            data = incremental_fixture("portable")
+            mutate(data)
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                norm(data, "portable")
+
+    def test_same_reference_is_reused_and_must_match(self):
+        data = incremental_fixture("portable", reference=f.BASELINE)
+        result = norm(data, "portable")
+        self.assertEqual(result["metrics"], result["incremental_metrics"])
+        data["rounds"]["portable"][0]["pr_base"]["samples"]["url_policy_5000_calls_ms"][0] = 200
+        with self.assertRaises(ValueError):
+            norm(data, "portable")
+
+    def test_push_not_applicable(self):
+        data = fixture("portable")
+        data.update(schema=2, incremental_reference_sha=None, candidate_sha=HEAD)
+        data["context"].update(event="push", pr_base_sha=None, pr_head_sha=None)
+        data["round_order"] = {"portable": [["baseline", "candidate"] if i % 2 == 0 else ["candidate", "baseline"] for i in range(f.PAIRS)]}
+        result = f.normalize_suite(data, "portable", 12, 2, "push", HEAD)
+        self.assertEqual(result["incremental_status"], "not_applicable")
 
 class PublishingTests(unittest.TestCase):
     def test_only_bot_owned_comment(self):

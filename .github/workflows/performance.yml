@@ -46,7 +46,7 @@ jobs:
           echo "HERDR_CHROME_BINARY=$CHROME" >> "$GITHUB_ENV"
       - name: Test report calculations
         run: python3 -m unittest discover -s scripts -p 'test_performance*.py' -v
-      - name: Compare immutable baseline with candidate
+      - name: Compare fixed baseline and exact PR base with candidate
         env:
           PERF_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PERF_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
