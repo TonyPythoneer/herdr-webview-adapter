@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
-    os::{fd::{FromRawFd, RawFd}, unix::{fs::PermissionsExt, process::CommandExt}},
+    os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::{fs::PermissionsExt, process::CommandExt}},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -389,6 +389,29 @@ pub fn shared_client() -> Result<Arc<Client>, String> {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
+            // Only the last Arc is dropping. No live caller can write concurrently.
+            // Nonblocking tiny Browser.close request; fallback to the existing kill
+            // path on any failure or if the bounded grace period expires.
+            if std::env::var_os("HERDR_EXPERIMENT_GRACEFUL_CLOSE").as_deref() == Some(std::ffi::OsStr::new("1"))
+                && let Ok(writer) = self.writer.get_mut()
+            {
+                let fd = writer.as_raw_fd();
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0 {
+                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                    let message = format!("{{\"id\":{id},\"method\":\"Browser.close\",\"params\":{{}}}}\0");
+                    if writer.write_all(message.as_bytes()).is_ok() {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while Instant::now() < deadline {
+                            match child.try_wait() {
+                                Ok(Some(status)) => { tracing::debug!(?status, "Chrome exited after Browser.close"); return; }
+                                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }

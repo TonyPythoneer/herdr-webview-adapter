@@ -1,0 +1,60 @@
+name: adapter-chrome-graceful-close
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/chrome_cdp.rs'
+      - 'examples/graceful_close.rs'
+      - '.github/workflows/chrome-graceful-close.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: chrome-graceful-close-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  experiment:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.95.0"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            ${{ runner.temp }}/herdr-perf-target
+          key: herdr-release-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml') }}-chrome-graceful-close
+          restore-keys: |
+            herdr-release-v2-${{ runner.os }}-${{ runner.arch }}-
+      - name: Run paired experiment
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/herdr-perf-target
+        run: |
+          set -euo pipefail
+          mkdir -p probe-report
+          git rev-parse HEAD > probe-report/revision.txt
+          sw_vers > probe-report/environment.txt
+          cargo build --release --example graceful_close
+          cp Cargo.lock probe-report/Cargo.lock
+          export HERDR_CHROME_BINARY="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          for i in 0 1 2 3 4 5; do
+            for j in "$((i%2))" "$((1-i%2))"; do
+              D="$(mktemp -d)"
+              HERDR_APP_HOME="$D" HERDR_EXPERIMENT_GRACEFUL_CLOSE="$j" "$CARGO_TARGET_DIR/release/examples/graceful_close" | tee -a probe-report/samples.jsonl
+              rm -rf "$D"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chrome-graceful-close-${{ github.run_attempt }}
+          path: probe-report/
+          if-no-files-found: warn
+          retention-days: 30
