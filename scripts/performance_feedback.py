@@ -97,6 +97,7 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
     check(isinstance(rounds, dict) and set(rounds) <= set(SUITES[matrix_suite]), "unexpected workloads")
     rows = []
     coverage = {}
+    browser_versions = set()
     for suite in SUITES[matrix_suite]:
         pairs = rounds.get(suite, [])
         check(isinstance(pairs, list) and len(pairs) <= PAIRS, "invalid pair count")
@@ -117,7 +118,9 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
                     normalized.setdefault(key, {"baseline": [], "candidate": []})[side].append(values)
             check(pair["baseline"]["meta"] == pair["candidate"]["meta"], "environment mismatch inside pair")
             if suite == "chrome":
-                check(isinstance(pair["baseline"]["meta"].get("chrome_version"), str) and bool(pair["baseline"]["meta"]["chrome_version"]), "missing Chrome version")
+                version = pair["baseline"]["meta"].get("chrome_version")
+                check(isinstance(version, str) and re.fullmatch(r"[0-9.]{1,40}", version), "invalid Chrome version")
+                browser_versions.add(version)
         for key, samples in sorted(normalized.items()):
             base, cand = samples["baseline"], samples["candidate"]
             deltas = [(statistics.median(y) / statistics.median(x) - 1) * 100
@@ -132,11 +135,22 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
                          "direction": "lower_is_better", "baseline": stats(sum(base, [])), "candidate": stats(sum(cand, [])),
                          "paired_delta_pct": statistics.median(deltas) if len(deltas) == PAIRS else None,
                          "pair_deltas_pct": deltas, "pair_delta_range_pct": [min(deltas), max(deltas)] if deltas else None,
-                         "signal": signal, "raw_samples_by_pair": samples, "source_candidates": metric_owner(key)})
+                         "signal": signal, "candidate_median_sum_per_pair": statistics.median(map(sum, cand)),
+                         "raw_samples_by_pair": samples, "source_candidates": metric_owner(key)})
+    check(len(browser_versions) <= 1, "Chrome changed across pairs")
+    env = data.get("environment", {})
+    check(isinstance(env, dict), "invalid environment")
+    # Only constrained identifiers enter agent-facing feedback; full environment
+    # and free-text error evidence stay in the original untrusted artifact.
+    safe_env = {k: v for k, v in env.items() if k in ("runner_os", "machine", "runner_image", "hardware")
+                and isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_. ,+-]{1,80}", v)}
+    if type(env.get("cpu_count")) is int and 0 < env["cpu_count"] <= 1024:
+        safe_env["cpu_count"] = env["cpu_count"]
+    safe_env["chrome_versions"] = sorted(browser_versions)
     return {"suite": matrix_suite, "status": status, "candidate_sha": candidate,
             "pr_base_sha": context.get("pr_base_sha") if event == "pull_request" else None,
             "workload_sha256": hashes, "lock_sha256": locks, "completed_pairs": coverage, "metrics": rows,
-            "environment_source": "original performance.json; free text intentionally not copied",
+            "environment": safe_env, "environment_source": "original performance.json; free text intentionally not copied",
             "reported_error_count": len(data["errors"]) if isinstance(data.get("errors"), list) else None}
 
 def assemble(run, suites, problems, pr_number=None):
@@ -155,11 +169,22 @@ def assemble(run, suites, problems, pr_number=None):
                            "source_candidates": row["source_candidates"],
                            "action": "reproduce against PR base with matching locks; profile this path before proposing a code change"})
     if complete and not regressions:
-        priorities.append({"priority": "P2", "action": "choose the next hypothesis from workload cost and profile evidence; do not optimize inconclusive deltas"})
+        # Rank only instrumented operation costs within Chrome, not unrelated
+        # wall/CPU/RSS counters or incomparable portable batch sizes.
+        hotspots = sorted((r for r in rows if r["workload"] == "chrome" and r["unit"] == "ms"
+                           and not r["metric"].endswith("_workload_wall_ms")),
+                          key=lambda r: -r["candidate_median_sum_per_pair"])[:3]
+        for row in hotspots:
+            priorities.append({"priority": "P2", "metric": row["metric"], "source_candidates": row["source_candidates"],
+                               "candidate_median_sum_ms_per_pair": row["candidate_median_sum_per_pair"],
+                               "action": "profile the measured operation cost; compare next candidate to PR base before claiming improvement"})
+        if not hotspots:
+            priorities.append({"priority": "P2", "action": "choose the next hypothesis from workload cost and profile evidence; do not optimize inconclusive deltas"})
     candidates = sorted({s["candidate_sha"] for s in suites.values()})
     return {"schema": "herdr.performance-feedback/v1", "status": "complete" if complete else "partial_or_failed",
             "run": {k: run[k] for k in ("id", "run_attempt", "head_sha", "event", "conclusion")},
             "pr_number": pr_number, "baseline_sha": BASELINE, "candidate_shas": candidates,
+            "pr_base_shas": sorted({s["pr_base_sha"] for s in suites.values() if s["pr_base_sha"]}),
             "comparison_scope": "immutable_pre_redesign_baseline_not_marginal_pr_effect",
             "method": {"pairs": PAIRS, "threshold_pct": THRESHOLD, "screening_only": True,
                        "delta": "median of paired process-median percentage changes",
