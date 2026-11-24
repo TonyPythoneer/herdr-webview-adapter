@@ -763,6 +763,47 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    fn read_fixture_headers(connection: &mut std::net::TcpStream, request: &mut [u8]) -> io::Result<usize> {
+        // macOS passes the listener's O_NONBLOCK flag to accepted sockets.
+        connection.set_nonblocking(false)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut n = 0;
+        while n < request.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            connection.set_read_timeout(Some(remaining))?;
+            match connection.read(&mut request[n..]) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => n += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+            if request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                return Ok(n);
+            }
+        }
+        Err(io::ErrorKind::InvalidData.into())
+    }
+
+    #[test]
+    fn fixture_reads_fragmented_headers_on_a_nonblocking_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        connection.set_nonblocking(true).unwrap();
+        client.write_all(b"GET /delayed").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b".js HTTP/1.1\r\n\r\n").unwrap();
+        });
+        let mut request = [0; 4096];
+        let n = read_fixture_headers(&mut connection, &mut request).unwrap();
+        assert_eq!(&request[..n], b"GET /delayed.js HTTP/1.1\r\n\r\n");
+        writer.join().unwrap();
+    }
+
     #[test]
     fn chrome_real_cdp_fixture() {
         if std::env::var_os("HERDR_CHROME_E2E").is_none() { return }
@@ -778,17 +819,13 @@ mod tests {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
-                        // TCP may split a request line between reads. Read the
-                        // bounded complete headers, not a single arbitrary chunk.
-                        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
-                        let mut n = 0;
-                        while n < request.len() && !request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                            match connection.read(&mut request[n..]) {
-                                Ok(0) | Err(_) => break,
-                                Ok(count) => n += count,
+                        let n = match read_fixture_headers(&mut connection, &mut request) {
+                            Ok(n) => n,
+                            Err(error) => {
+                                eprintln!("Chrome fixture skipped incomplete request: {error}");
+                                continue;
                             }
-                        }
-                        if !request[..n].windows(4).any(|w| w == b"\r\n\r\n") { continue }
+                        };
                         // A parser-blocking script keeps readyState at "loading" while
                         // the actual target exists, exercising readiness wakeups.
                         if request[..n].starts_with(b"GET /delayed.js ") {
