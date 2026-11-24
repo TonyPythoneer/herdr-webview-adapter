@@ -161,6 +161,94 @@ def _normalize_pairwise(data, matrix_suite, run_id, attempt, event, head):
             "environment": safe_env, "environment_source": "original performance.json; free text intentionally not copied",
             "reported_error_count": len(data["errors"]) if isinstance(data.get("errors"), list) else None}
 
+PROFILE_PROBES = {
+    "session_first_frame": ("chrome_session_open_ms", "chrome_first_frame_receive_ms"),
+    "screenshot": ("chrome_screenshot_png_ms",),
+    "eval_1mib": ("chrome_eval_1mib_ms",),
+}
+PROFILE_CATEGORIES = ("wait_or_sleep", "read_syscall", "write_syscall", "json", "base64", "allocation", "other")
+PROFILE_REASONS = ("sampler_unavailable", "probe_not_ready", "sampler_failed", "probe_failed",
+                   "missing_operation_proof", "invalid_operation_proof", "diagnostic_failed")
+
+def normalize_profile(data, matrix_suite):
+    # Optional diagnostic evidence is deliberately separate from benchmark
+    # correctness. Never copy arbitrary sample text or error messages.
+    if matrix_suite != "native":
+        return {"status": "not_applicable", "probes": []}
+    profile = data.get("profiling")
+    if profile is None:
+        return {"status": "unavailable", "probes": []}
+    invalid = {"status": "invalid_diagnostic", "probes": []}
+    if not isinstance(profile, dict) or profile.get("schema") != 1 or profile.get("method") != "macos_sample_adapter_top_of_stack" or profile.get("scope") != "candidate_only_diagnostic":
+        return invalid
+    probes = profile.get("probes")
+    if not isinstance(probes, list) or len(probes) > 2:
+        return invalid
+    normalized = []
+    seen = set()
+    for item in probes:
+        if not isinstance(item, dict):
+            return invalid
+        operation = item.get("operation")
+        if not isinstance(operation, str) or operation not in PROFILE_PROBES or operation in seen:
+            return invalid
+        seen.add(operation)
+        status = item.get("status")
+        if status == "unavailable" and item.get("reason") in PROFILE_REASONS:
+            normalized.append({"operation": operation, "status": status, "reason": item["reason"]})
+            continue
+        n, elapsed, counts = item.get("operations"), item.get("elapsed_ms"), item.get("top_stack_counts")
+        if (status != "measured" or type(n) is not int or not 1 <= n <= 4096
+                or not finite_number(elapsed) or not 0 < elapsed <= 60000
+                or item.get("sample_seconds") != 2 or item.get("interval_ms") != 10
+                or not isinstance(counts, dict) or set(counts) != set(PROFILE_CATEGORIES)
+                or not all(type(x) is int and 0 <= x <= 10000000 for x in counts.values())
+                or not 0 < sum(counts.values()) <= 10000000):
+            return invalid
+        normalized.append({"operation": operation, "status": status, "operations": n, "elapsed_ms": elapsed,
+                           "sample_seconds": 2, "interval_ms": 10, "top_stack_counts": counts,
+                           "source_log": "profile-" + operation + ".sample.txt",
+                           "related_metrics": list(PROFILE_PROBES[operation])})
+    measured = sum(p["status"] == "measured" for p in normalized)
+    status = ("measured" if normalized and measured == len(normalized) else
+              "partial" if measured else "unavailable")
+    return {"status": status, "method": "macos_sample_adapter_top_of_stack",
+            "scope": "candidate_only_diagnostic", "probes": normalized,
+            "interpretation": "Collapsed leaf-stack counts include blocked threads, omit low-count symbols and are not CPU time or root-cause proof."}
+
+def normalize_ci_cache(data):
+    # CI optimization measurements are optional, distinct from browser metrics.
+    value = data.get("cache")
+    timing = data.get("execution_timing_seconds", {})
+    result = {"status": "unavailable", "binaries": {}, "fixtures": {}, "execution_timing_seconds": {}}
+    if isinstance(timing, dict):
+        for category, allowed in (("prepare_and_build", ("baseline","pr_base","candidate")),
+                                  ("measurement", ("portable","chrome","wk_native_pixels","wk_native_input"))):
+            rows = timing.get(category, {})
+            if isinstance(rows, dict):
+                result["execution_timing_seconds"][category] = {
+                    k:v for k,v in rows.items() if k in allowed and finite_number(v) and 0 <= v <= 10000}
+        profile_time = timing.get("profiling")
+        if finite_number(profile_time) and 0 <= profile_time <= 10000:
+            result["execution_timing_seconds"]["profiling"] = profile_time
+        cache_hit = timing.get("build_cache_hit")
+        if cache_hit in ("true", "false"):
+            result["compilation_cache_exact_hit"] = cache_hit == "true"
+    if not isinstance(value, dict):
+        return result
+    binaries, fixtures = value.get("binaries"), value.get("fixtures")
+    if not isinstance(binaries, dict) or not isinstance(fixtures, dict):
+        return result
+    allowed_status = ("hit", "miss", "miss_write_failed", "disabled_unknown_environment")
+    for side, entry in binaries.items():
+        if side in ("baseline","pr_base","candidate") and isinstance(entry, dict) and entry.get("status") in allowed_status:
+            result["binaries"][side] = entry["status"]
+    for name, status in fixtures.items():
+        if name in ("workload.rs","wk_native_pixels.rs","wk_native_input.rs","fixture.html") and status in ("hit","miss"):
+            result["fixtures"][name] = status
+    result["status"] = "reported"
+    return result
+
 def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
     """Validate both comparisons against the same measured candidate samples."""
     check(isinstance(data, dict) and data.get("schema") in (1, 2), "unknown source schema")
@@ -168,6 +256,8 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
         result = _normalize_pairwise(data, matrix_suite, run_id, attempt, event, head)
         result["incremental_status"] = "unavailable" if event == "pull_request" else "not_applicable"
         result["incremental_metrics"] = []
+        result["profiling"] = normalize_profile(data, matrix_suite)
+        result["ci_cache"] = normalize_ci_cache(data)
         return result
     reference = data.get("incremental_reference_sha")
     context = data.get("context", {})
@@ -221,6 +311,8 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
     result["incremental_status"] = "not_applicable"
     result["incremental_metrics"] = []
     result["round_order"] = orders
+    result["profiling"] = normalize_profile(data, matrix_suite)
+    result["ci_cache"] = normalize_ci_cache(data)
     if reference:
         inc = normalize(incremental, "pr_base")
         result["incremental_status"] = "complete" if inc["status"] == "measured" else "partial_or_failed"
@@ -267,6 +359,12 @@ def assemble(run, suites, problems, pr_number=None):
                                "action": "profile the measured operation cost; compare next candidate to PR base before claiming improvement"})
         if not hotspots:
             priorities.append({"priority": "P2", "action": "choose the next hypothesis from workload cost and profile evidence; do not optimize inconclusive deltas"})
+    profiling = suites.get("native", {}).get("profiling", {"status": "unavailable", "probes": []})
+    for action in priorities:
+        for probe in profiling["probes"]:
+            if action.get("metric") in probe.get("related_metrics", ()):
+                action["profile_probe"] = probe["operation"]
+                action["profile_status"] = probe["status"]
     candidates = sorted({s["candidate_sha"] for s in suites.values()})
     return {"schema": "herdr.performance-feedback/v2", "status": "complete" if complete else "partial_or_failed",
             "run": {k: run[k] for k in ("id", "run_attempt", "head_sha", "event", "conclusion")},
@@ -278,7 +376,7 @@ def assemble(run, suites, problems, pr_number=None):
                        "tail_percentiles": "descriptive; not a confidence interval"},
             "coverage": {s: suites[s]["completed_pairs"] if s in suites else None for s in SUITES},
             "signals": signals, "incremental": {"status": incremental_status, "reference_shas": sorted({s["incremental_reference_sha"] for s in suites.values() if s.get("incremental_reference_sha")}), "signals": signal_counts(incremental_rows)},
-            "decision_scope": scope, "problems": problems, "suites": suites, "next_actions": priorities,
+            "decision_scope": scope, "profiling": profiling, "problems": problems, "suites": suites, "next_actions": priorities,
             "limitations": ["No full host presentation, GPUI main-thread or input-to-display latency.",
                             "Sampled RSS and CPU include harness/accounting limitations.",
                             "Do not compare across runner environments or workload hashes.",
@@ -321,6 +419,26 @@ def render_comment(report, repo, reporter_id):
             lines.append(f"| `{row['metric']}` | {row['unit']} | {row['baseline']['p50']:.4g} | {row['candidate']['p50']:.4g} | {delta} | {row['signal'].replace('_',' ')} |")
     else:
         lines.append("No complete direct comparison; do not infer incremental PR impact.")
+    profiling = report.get("profiling", {"status": "unavailable", "probes": []})
+    lines += ["", "### Targeted diagnostic profiling", "", f"Status: **{profiling['status'].replace('_', ' ')}**",
+              "Candidate-only sampling, after timed measurements. Stack counts include blocked threads; not CPU shares or proof of root cause."]
+    for probe in profiling["probes"]:
+        if probe["status"] != "measured":
+            lines.append(f"- `{probe['operation']}`: unavailable ({probe['reason']})")
+            continue
+        counts = probe["top_stack_counts"]
+        top = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+        lines.append(f"- `{probe['operation']}`: {probe['operations']} verified operations; top collapsed stacks: "
+                     + ", ".join(f"{key}={count}" for key, count in top)
+                     + f". Raw evidence: `{probe['source_log']}`.")
+    lines += ["", "### CI cache and build cost", "", "| Suite | Binary cache | Fixture hits | Build seconds |", "|---|---|---:|---:|"]
+    for name, suite in sorted(report["suites"].items()):
+        cache = suite.get("ci_cache", {})
+        binary = ", ".join(f"{side}: {status}" for side, status in cache.get("binaries", {}).items()) or "unavailable"
+        fixtures = cache.get("fixtures", {})
+        timing = cache.get("execution_timing_seconds", {}).get("prepare_and_build", {})
+        seconds = f"{sum(timing.values()):.1f}" if timing else "unavailable"
+        lines.append(f"| {name} | {binary} | {sum(v == 'hit' for v in fixtures.values())}/{len(fixtures)} | {seconds} |")
     lines += ["", "### Next engineering actions"]
     for a in report["next_actions"][:6]:
         lines.append(f"- **{a['priority']}** " + (f"`{a['metric']}`: " if "metric" in a else "") + a["action"] + (" (" + ", ".join("`"+p+"`" for p in a["source_candidates"]) + ")" if "source_candidates" in a else ""))

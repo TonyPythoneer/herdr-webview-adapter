@@ -84,3 +84,102 @@ preferring the PR base for the candidate; committed locks are preserved.
 Same-run pairing controls some runner variation but is still a screening
 measurement, not statistical proof. Do not subtract historical percentages
 from different runs. Confirm significant findings on controlled hardware.
+
+## Phase 5 — Targeted diagnostic profiling
+
+After every successful native benchmark, choose at most two Chrome diagnostic
+probes. Prefer direct PR-base regression signals when available, then rank by
+the median accumulated candidate operation time within the fixed workload.
+Supported probes: session open/first frame/confirmed close, screenshot PNG,
+and 1 MiB evaluation. Startup and other uncovered operations remain explicit
+profiling gaps. No production adapter instrumentation or new dependency is
+needed: reuse the already-built candidate release example.
+
+Each diagnostic starts a fresh private profile and local fixture, proves the
+requested browser operation repeatedly for up to six seconds (bounded count),
+and invokes macOS `/usr/bin/sample` on only the owned adapter harness PID for
+two seconds at 10 ms intervals. This occurs AFTER the timed rounds; neither
+sampler overhead nor diagnostic timings enter cumulative or incremental metrics.
+The probe process group has bounded timeouts and cleanup. Raw
+`profile-*.sample.txt`, `profile-*.log` and sampler logs remain in the original
+native benchmark artifact. Optional `profiling` fields are available in the
+raw and feedback JSON, and a bounded section in the PR comment.
+
+The reporter extracts only allowlisted numeric collapsed leaf-stack counts:
+wait/sleep, generic read/write syscalls, JSON, base64, allocation, other.
+Counts span sampled adapter threads (including idle or blocked threads);
+low-count symbols may be omitted by the OS. They are NOT CPU percentages,
+Chrome subprocess measurements, UI presentation latency or causal attribution.
+The session probe includes open, first frame and close; it cannot isolate
+the first-frame stage. Read raw stacks before modifying code. Missing sampler,
+failed probe, or malformed optional data is visibly unavailable/partial/invalid
+without changing any required benchmark or correctness result. Older reports
+remain readable.
+
+Use these diagnostics to choose a falsifiable investigation. For example,
+blocked stacks in the frame probe warrant examining wait and protocol timing,
+not automatically optimizing JSON; substantial serialization leaf stacks
+warrant a focused parser/transport experiment. Measure the proposed change
+against the exact PR base; never equate a sampling category with a proven
+root cause. Do not add more probes unless they close a specific evidence gap.
+
+## CI runtime optimization
+
+The Ubuntu and macOS correctness jobs and the portable/native performance jobs
+already run independently. Cargo compiles independent crates in parallel and
+Rust's libtest uses its normal parallel test runner. The expensive part of the
+native performance job was three separate dependency builds, not the timed
+workloads (PR #10 run 45349169737: roughly 12 minutes preparing/building and
+2.4 minutes measuring). The native correctness job likewise spent roughly
+8 minutes preparing/building before its unit tests.
+
+Reuse a single Cargo release target directory for all measured revisions,
+but explicitly clean the measured package before each build and copy every
+release executable into its own verified, executable snapshot before the next
+build. Cargo still validates dependency fingerprints and each revision's lock.
+Record the binary SHA-256s, preparation/build durations, measurement durations,
+and optional profiling duration in the raw artifact. Never reuse measurements.
+Native correctness and performance jobs use independent compilation caches,
+keyed by OS, architecture, runner image, Rust toolchain and manifest/lock hash.
+A cache miss is valid; the first run may populate a cache rather than speed up.
+Compare cold and warm timings before claiming an improvement.
+
+Do not parallelize benchmark rounds on the same runner: CPU, memory and browser
+contention would invalidate comparisons. Native UI tests also retain their
+existing isolation. If measurement time later dominates, split independent
+workloads across isolated runners, keeping each workload's three revisions on
+the same machine. No correctness or native proof gate is removed.
+
+### All-platform cache layers
+
+Both correctness and benchmark workflows restore Rust registry/git sources,
+Cargo target outputs and a bounded 512 MiB local sccache store on both Ubuntu
+and macOS. A pinned sccache version is enabled only after successful setup;
+compiler stats are logged and the benchmark records JSON statistics before
+timed measurements. GitHub cache scopes isolate PR caches from trusted main.
+The dev/test and release stores are separated. Cargo still checks its
+dependency fingerprints and all correctness tests execute every run.
+
+The benchmark additionally stores exact-revision executables in a
+content-addressed cache, keyed by revision SHA, actual resolved lock SHA-256,
+all workload/fixture bytes, build/cache scripts, Rust/Cargo/compiler and SDK
+versions, OS/architecture/runner image and relevant build flags. A hit verifies
+each executable's hash, manifest and executable bit, then snapshots it into
+the revision's fresh run directory. A mismatch or damaged entry rebuilds.
+Unknown runner images disable persistent binary reuse. Entries are bounded to
+eight revisions and 350 MiB total; old entries are evicted. The three immutable
+Rust fixture sources and static local HTML are likewise content-addressed,
+validated against current bytes and reused in the same archive. No browser
+profile, native UI state, external response, test outcome, benchmark sample or
+profiling observation is cached.
+
+A first run populates the stores; reruns and subsequent PRs can reuse matching
+entries. Record exact cache hit, per-revision binary hits, fixture hits and
+stage durations in performance.json and the normalized AI feedback artifact.
+Do not compare cache timings to product performance timings. Shared Cargo
+target still handles misses efficiently. Correctness and five paired
+measurements stay mandatory. The previous cold shared-target run
+45355598936 measured baseline 296.196 s, PR base 40.371 s, candidate 33.333 s
+(369.900 s total), down from roughly 726 s before shared-target reuse.
+Future cold/warm measurements must include cache transfer overhead before
+claiming end-to-end speedup.

@@ -29,3 +29,9 @@ PR gains from a cumulative fixed-baseline comparison. Prefer complete direct
 PR-base comparisons (`incremental.status` and `decision_scope`) for the
 current change; use fixed-baseline results for long-term context. Correctness gates and
 manual native Host E2E remain mandatory.
+
+When feedback contains `profiling`, inspect the selected probe's raw stack
+artifact before committing an optimization. Sample counts include waiting
+threads; they are not CPU utilization or causal proof. Missing diagnostics
+are an evidence gap, not a performance regression. Prefer a targeted
+reproduction and a falsifiable hypothesis over speculative changes.
