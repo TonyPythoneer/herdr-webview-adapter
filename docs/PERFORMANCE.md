@@ -183,3 +183,31 @@ measurements stay mandatory. The previous cold shared-target run
 (369.900 s total), down from roughly 726 s before shared-target reuse.
 Future cold/warm measurements must include cache transfer overhead before
 claiming end-to-end speedup.
+
+
+## Phase 6 — Wake Chrome document readiness on lifecycle events
+
+PR #11 native run 45359588188, measured candidate
+`8787e665c4e2e395e4a9572622f89df099599253`: screenshot sampling showed
+164 request-wait and 164 pipe-read leaf observations, and the session probe
+(35 completed operations) sampled CDP waits and first-frame waits. Neither
+establishes parser CPU pressure. Raw artifact 14905066512 contains the stacks.
+Workload SHA-256 (workload.rs):
+`8d72ba0b1fd474ff43dd03f84a1849acc8b73daef5a9b9896a96d930a7eb70cd`.
+PR-base and candidate native lock SHA-256:
+`c7fdd477a6b528f029e3318267facd26ad4482210cc58d4f0d9bf959cf29a809`.
+
+Hypothesis: when the first readiness check occurs while a document is loading,
+Page.domContentEventFired / Page.loadEventFired can wake the next state check
+earlier than a fixed 150 ms sleep. This is a source-supported latency opportunity,
+not a proven cause of the baseline p50. The reader uses a bounded one-slot
+notification per flattened session; every wake still verifies href and readyState.
+The original polling fallback, navigation retry, timeout, ACK path and PNG
+format stay intact. No changes to the fixed benchmark harness.
+
+Primary metric: incremental chrome_session_open_ms. Also inspect first-frame
+receive, total Chrome workload, CPU/RSS, and correctness. Existing fixture can
+already be ready at the first check; an inconclusive result must not be reported
+as an improvement. Native correctness includes a delayed-document fixture.
+Use the same five paired rounds and existing screening threshold; retain only
+if supported by evidence and host E2E. No claim of UI presentation speed.

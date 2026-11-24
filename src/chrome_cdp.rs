@@ -15,7 +15,7 @@ use std::{
     sync::{
         Arc, Mutex, Weak, OnceLock,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
     time::{Duration, Instant},
 };
@@ -96,6 +96,28 @@ fn pipe_pair() -> io::Result<(RawFd, RawFd)> {
     Ok((safe[0], safe[1]))
 }
 
+// Readiness notifications are hints, not proof that the requested document
+// is interactive. Coalesce bursts without ever blocking the CDP reader.
+const DOCUMENT_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+#[derive(Clone)]
+struct SessionEvents {
+    frames: SyncSender<String>,
+    document_ready: SyncSender<()>,
+}
+
+fn is_document_ready_event(method: &str) -> bool {
+    matches!(method, "Page.domContentEventFired" | "Page.loadEventFired")
+}
+
+fn wait_for_document_hint(receiver: &Receiver<()>) {
+    if let Err(RecvTimeoutError::Disconnected) = receiver.recv_timeout(DOCUMENT_POLL_INTERVAL) {
+        // Keep the original bounded polling cadence even if the hint channel
+        // disconnects unexpectedly; never spin on a disconnected receiver.
+        std::thread::sleep(DOCUMENT_POLL_INTERVAL);
+    }
+}
+
 pub struct Client {
     child: Mutex<Child>,
     writer: Mutex<File>,
@@ -103,7 +125,7 @@ pub struct Client {
     pending: Mutex<HashMap<u64, Sender<Result<Value, String>>>>,
     // Keep the CDP reader free of PNG decoding; its job is dispatching
     // responses promptly, including navigation and security-sensitive inputs.
-    frames: Mutex<HashMap<String, SyncSender<String>>>,
+    frames: Mutex<HashMap<String, SessionEvents>>,
     // Screencast ACK writes must never happen inside the pipe reader:
     // Chrome can block writing a large PNG while waiting for the next ACK.
     // Writing an ACK synchronously from its reader creates a pipe deadlock.
@@ -243,7 +265,16 @@ impl Client {
             }
             return;
         }
-        if message.get("method").and_then(Value::as_str) != Some("Page.screencastFrame") {
+        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        if is_document_ready_event(method) {
+            if let Some(session) = message.get("sessionId").and_then(Value::as_str)
+                && let Some(events) = self.frames.lock().unwrap().get(session)
+            {
+                let _ = events.document_ready.try_send(());
+            }
+            return;
+        }
+        if method != "Page.screencastFrame" {
             return;
         }
         let Some(Value::String(session)) = message.get_mut("sessionId").map(Value::take) else { return };
@@ -255,7 +286,7 @@ impl Client {
         }
         let Some(Value::String(data)) = params.get_mut("data").map(Value::take) else { return };
         if data.len() > MAX_FRAME_BASE64 { return }
-        let sender = self.frames.lock().unwrap().get(&session).cloned();
+        let sender = self.frames.lock().unwrap().get(&session).map(|events| events.frames.clone());
         if let Some(sender) = sender {
             // Transfer ownership of the bounded encoded payload. No extra
             // full-frame copy and no PNG decoding on the pipe-reader thread.
@@ -276,7 +307,11 @@ impl Client {
         let session = self.request("Target.attachToTarget", json!({"targetId":target,"flatten":true}), None)?
             .get("sessionId").and_then(Value::as_str).ok_or("CDP sessionId missing")?.to_owned();
         let (tx, rx) = mpsc::sync_channel(2);
-        self.frames.lock().unwrap().insert(session.clone(), tx);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        self.frames.lock().unwrap().insert(session.clone(), SessionEvents {
+            frames: tx,
+            document_ready: ready_tx,
+        });
         let pane = Session { client: self.clone(), target, session, frames: Mutex::new(rx) };
         pane.command("Page.enable", json!({}))?;
         pane.command("Runtime.enable", json!({}))?;
@@ -299,6 +334,9 @@ impl Client {
         let mut last_state = "unknown".to_owned();
         let mut ready = false;
         while started.elapsed() < Duration::from_secs(20) {
+            // Consume a stale hint before checking current state. A hint that
+            // arrives during/after eval stays queued and wakes the next check.
+            let _ = ready_rx.try_recv();
             if let Ok(state) = pane.eval("({href:location.href,ready:document.readyState})") {
                 let href = state["href"].as_str().unwrap_or("");
                 let phase = state["ready"].as_str().unwrap_or("unknown");
@@ -319,7 +357,7 @@ impl Client {
                 retried_navigation = true;
                 pane.navigate(&url)?;
             }
-            std::thread::sleep(Duration::from_millis(150));
+            wait_for_document_hint(&ready_rx);
         }
         if !ready {
             return Err(format!(
@@ -495,6 +533,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn document_ready_hints_are_bounded_and_only_lifecycle_events() {
+        assert!(is_document_ready_event("Page.domContentEventFired"));
+        assert!(is_document_ready_event("Page.loadEventFired"));
+        for method in ["Page.frameNavigated", "Page.screencastFrame", "Runtime.consoleAPICalled", ""] {
+            assert!(!is_document_ready_event(method));
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.try_send(()).unwrap();
+        assert!(matches!(tx.try_send(()), Err(mpsc::TrySendError::Full(()))));
+        wait_for_document_hint(&rx);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        tx.try_send(()).unwrap();
+        wait_for_document_hint(&rx);
+    }
+
+    #[test]
     fn version_detection_is_strict() {
         assert_eq!(chrome_major("Google Chrome 143.0.12.6"), Some(143));
         assert_eq!(chrome_major("Google Chrome 136.0.0.0"), Some(136));
@@ -531,7 +585,20 @@ mod tests {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
-                        let _ = connection.read(&mut request);
+                        let n = connection.read(&mut request).unwrap_or(0);
+                        // A parser-blocking script keeps readyState at "loading" while
+                        // the actual target exists, exercising readiness wakeups.
+                        if request[..n].starts_with(b"GET /delayed.js ") {
+                            std::thread::sleep(Duration::from_millis(250));
+                            let body = "document.title = 'Herdr delayed fixture';";
+                            let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                            continue;
+                        }
+                        if request[..n].starts_with(b"GET /delayed ") {
+                            let body = "<html><head><title>Loading</title><script src='/delayed.js'></script></head><body>Delayed document</body></html>";
+                            let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                            continue;
+                        }
                         let body = "<html><head><title>Herdr fixture</title></head><body><button id='click' onclick=\"document.getElementById('state').textContent='clicked'\">Click</button><span id='state'>idle</span><input id='text'><input id='otp' autocomplete='one-time-code' value='481902'><input id='card' autocomplete='cc-number' value='4111111111111111'><input id='pass' type='password' value='Secret1'><form onsubmit=\"event.preventDefault();window.__submitted=true\"><button id='disguised-submit' type='submit'>Search</button></form><a id='destructive-link' href='/delete/account'>Search</a><script>window.__submitted=false</script></body></html>";
                         let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                     }
@@ -641,6 +708,13 @@ mod tests {
             .expect_err("cancellation gate") .starts_with("CANCELLED"));
 
         drop(pane);
+        let delayed = client.open(&format!("http://{address}/delayed"))
+            .expect("delayed document must become interactive before screencast");
+        let state = delayed.eval("({title:document.title,ready:document.readyState})").unwrap();
+        assert!(matches!(state["ready"].as_str(), Some("interactive" | "complete")));
+        assert_eq!(state["title"], "Herdr delayed fixture");
+        assert!(delayed.frame_timeout(Duration::from_secs(10)).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+        drop(delayed);
         drop(client);
         stop.store(true, AtomicOrdering::Relaxed);
         server.join().unwrap();
