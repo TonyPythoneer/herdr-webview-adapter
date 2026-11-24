@@ -1,6 +1,9 @@
-import copy
 import io
 import json
+import tempfile
+from pathlib import Path
+import os
+import sys
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -135,6 +138,61 @@ class PublishingTests(unittest.TestCase):
         self.assertTrue(pub.eligible_run(run, REPO, 5))
         self.assertFalse(pub.eligible_run(dict(run, workflow_id=6), REPO, 5))
         self.assertFalse(pub.eligible_run(dict(run, status="in_progress"), REPO, 5))
+
+
+    def test_publish_replay_and_partial_artifact(self):
+        run = dict(RUN, workflow_id=5, path=".github/workflows/performance.yml",
+                   repository={"full_name": REPO}, head_repository={"full_name": REPO}, status="completed")
+        pr = {"number": 7, "state": "open", "head": {"sha": HEAD}, "base": {"sha": BASE}}
+        comments = []
+        archives = {}
+        for i, suite in enumerate(f.SUITES, 1):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr("performance.json", json.dumps(fixture(suite)))
+            archives[i] = buf.getvalue()
+        def fake_api(path, method="GET", payload=None, binary=False):
+            if path.endswith("workflows/performance.yml"):
+                return {"id": 5}
+            if path.endswith("/runs/12"):
+                return run
+            if "/runs/12/artifacts?" in path:
+                return {"artifacts": [{"id": i, "name": f"adapter-performance-{suite}-2",
+                                       "size_in_bytes": len(archives[i]), "expired": False}
+                                      for i, suite in enumerate(f.SUITES, 1) if i in archives]}
+            if path.endswith("/zip"):
+                return archives[int(path.split("/")[-2])]
+            if "/commits/" in path:
+                return {"parents": [{"sha": BASE}, {"sha": HEAD}]}
+            if path.endswith("/pulls/7"):
+                return pr
+            if method == "POST":
+                comments.append({"id": 42, "user": {"id": pub.BOT_ID}, "body": payload["body"]})
+                return comments[-1]
+            if method == "PATCH":
+                comments[0]["body"] = payload["body"]
+                return comments[0]
+            raise AssertionError(path)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pub, "api", side_effect=fake_api), \
+             patch.object(pub, "match_pr", return_value=pr), patch.object(pub, "newest_run", return_value=True), \
+             patch.object(pub, "paged", side_effect=lambda *a, **kw: iter(comments)), \
+             patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99"}), \
+             patch.object(sys, "argv", ["report", "--run-id", "12", "--out", tmp]):
+            self.assertEqual(pub.main(), 0)
+            self.assertEqual(len(comments), 1)
+            self.assertEqual(json.loads((Path(tmp) / "benchmark-feedback.json").read_text())["status"], "complete")
+            self.assertEqual(pub.main(), 0)
+            self.assertEqual(len(comments), 1)
+            archives.pop(2)
+            self.assertEqual(pub.main(), 0)
+            self.assertEqual(len(comments), 1)
+            self.assertIn("partial or failed", comments[0]["body"])
+            report = json.loads((Path(tmp) / "benchmark-feedback.json").read_text())
+            self.assertEqual(report["next_actions"][0]["priority"], "P0")
+            pr["head"]["sha"] = BASE
+            previous = comments[0]["body"]
+            self.assertEqual(pub.main(), 0)
+            self.assertEqual(comments[0]["body"], previous)
 
 if __name__ == "__main__":
     unittest.main()
