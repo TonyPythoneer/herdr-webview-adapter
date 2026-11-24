@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import traceback
+import performance_profile as profiler
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "acf81de1738bf6ef2e4f6194208eb268e7523842"
@@ -255,6 +256,11 @@ def report(data, out):
             for r in rows:
                 delta="N/A" if r["paired_delta_pct"] is None else f"{r['paired_delta_pct']:+.1f}%"
                 lines.append(f"| {r['metric']} | {r['baseline']['p50']:.4g} | {r['candidate']['p50']:.4g} | {delta} | {r['classification']} |")
+    probes=data.get("profiling",{}).get("probes",[])
+    if probes:
+        lines += ["","## Candidate-only diagnostic profiling","","Separate macOS sample run after all timed rounds; collapsed top-of-stack counts include blocked threads and are not CPU percentages. Raw sample and probe logs are in the artifact.","","| Probe | Status | Operations | Top-stack counts |","|---|---|---:|---|"]
+        for probe in probes:
+            lines.append(f"| {probe['operation']} | {probe['status']} | {probe.get('operations','N/A')} | {probe.get('top_stack_counts',probe.get('reason','N/A'))} |")
     lines += ["","## Coverage and limitations", "", "- No full Herdr host dispatch, GPUI main-thread latency, presentation FPS, input-to-display latency, or full WebKit XPC process accounting in this standalone repo. Not measured; no claims.",
               "- Chrome first frame receive starts after session open; click latency ends at observed DOM, not display. WK metrics are full real smoke workload wall time including fixed waits and startup/teardown.",
               "- RSS is sampled peak, not exact high-water mark; descendants excludes reparented processes. CPU includes waited children and sampler overhead. Shared memory may be counted multiple times.",
@@ -277,7 +283,7 @@ def main():
     out.mkdir(parents=True,exist_ok=True)
     native=args.suite=="native"
     head=run("git","rev-parse","HEAD")
-    data={"schema":2,"baseline_sha":BASELINE,"candidate_sha":head,"incremental_reference_sha":None,"status":"failed","comparison":{},"incremental_comparison":{},"rounds":{},"round_order":{},"errors":[],
+    data={"schema":2,"baseline_sha":BASELINE,"candidate_sha":head,"incremental_reference_sha":None,"status":"failed","comparison":{},"incremental_comparison":{},"rounds":{},"round_order":{},"errors":[],"profiling":{"schema":1,"method":"macos_sample_adapter_top_of_stack","scope":"candidate_only_diagnostic","probes":[]},
           "context":{"run_id":os.getenv("GITHUB_RUN_ID"),"run_attempt":os.getenv("GITHUB_RUN_ATTEMPT"),"event":os.getenv("GITHUB_EVENT_NAME"),"suite":args.suite,"pr_head_sha":os.getenv("PERF_PR_HEAD_SHA"),"pr_base_sha":os.getenv("PERF_PR_BASE_SHA")},
           "environment":{"platform":platform.platform(),"machine":platform.machine(),"cpu_count":os.cpu_count(),"runner_image":os.getenv("ImageVersion"),"runner_os":os.getenv("RUNNER_OS"),"rust":run("rustc","-Vv"),"cargo":run("cargo","-V")},
           "workload_sha256":{p.name:digest(p) for p in (ROOT/"benchmarks").glob("*.rs")},"lock_sha256":{}}
@@ -336,6 +342,14 @@ def main():
                 if pr_base:
                     data["incremental_comparison"][suite]=compare(comparison_pairs(rounds,"pr_base"),suite)
             data["status"]="measured"
+            # Only after every timed measurement and native proof succeeds.
+            # Profiling is diagnostic, never part of the comparison or correctness gate.
+            if native:
+                try:
+                    data["profiling"]=profiler.diagnose(bins["candidate"]["perf_fixed"],data["rounds"]["chrome"],data["incremental_comparison"].get("chrome",data["comparison"]["chrome"]),tmp,url,out)
+                except Exception:
+                    traceback.print_exc()
+                    data["profiling"]["diagnostic_error"]=True
         except Exception as exc:
             data["errors"].append(str(exc))
             traceback.print_exc()

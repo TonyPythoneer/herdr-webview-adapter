@@ -84,3 +84,41 @@ preferring the PR base for the candidate; committed locks are preserved.
 Same-run pairing controls some runner variation but is still a screening
 measurement, not statistical proof. Do not subtract historical percentages
 from different runs. Confirm significant findings on controlled hardware.
+
+## Phase 5 — Targeted diagnostic profiling
+
+After every successful native benchmark, choose at most two Chrome diagnostic
+probes. Prefer direct PR-base regression signals when available, then rank by
+the median accumulated candidate operation time within the fixed workload.
+Supported probes: session open/first frame/confirmed close, screenshot PNG,
+and 1 MiB evaluation. Startup and other uncovered operations remain explicit
+profiling gaps. No production adapter instrumentation or new dependency is
+needed: reuse the already-built candidate release example.
+
+Each diagnostic starts a fresh private profile and local fixture, proves the
+requested browser operation repeatedly for up to six seconds (bounded count),
+and invokes macOS `/usr/bin/sample` on only the owned adapter harness PID for
+two seconds at 10 ms intervals. This occurs AFTER the timed rounds; neither
+sampler overhead nor diagnostic timings enter cumulative or incremental metrics.
+The probe process group has bounded timeouts and cleanup. Raw
+`profile-*.sample.txt`, `profile-*.log` and sampler logs remain in the original
+native benchmark artifact. Optional `profiling` fields are available in the
+raw and feedback JSON, and a bounded section in the PR comment.
+
+The reporter extracts only allowlisted numeric collapsed leaf-stack counts:
+wait/sleep, generic read/write syscalls, JSON, base64, allocation, other.
+Counts span sampled adapter threads (including idle or blocked threads);
+low-count symbols may be omitted by the OS. They are NOT CPU percentages,
+Chrome subprocess measurements, UI presentation latency or causal attribution.
+The session probe includes open, first frame and close; it cannot isolate
+the first-frame stage. Read raw stacks before modifying code. Missing sampler,
+failed probe, or malformed optional data is visibly unavailable/partial/invalid
+without changing any required benchmark or correctness result. Older reports
+remain readable.
+
+Use these diagnostics to choose a falsifiable investigation. For example,
+blocked stacks in the frame probe warrant examining wait and protocol timing,
+not automatically optimizing JSON; substantial serialization leaf stacks
+warrant a focused parser/transport experiment. Measure the proposed change
+against the exact PR base; never equate a sampling category with a proven
+root cause. Do not add more probes unless they close a specific evidence gap.

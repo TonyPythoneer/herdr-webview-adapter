@@ -33,7 +33,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Test trusted report parser
-        run: python3 -m unittest discover -s scripts -p 'test_performance_feedback.py' -v
+        run: python3 -m unittest discover -s scripts -p 'test_performance*.py' -v
       - name: Generate feedback and publish PR comment
         env:
           GH_TOKEN: ${{ github.token }}

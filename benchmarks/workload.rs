@@ -95,11 +95,63 @@ fn chrome() {
     sample("chrome_client_shutdown", || drop(client));
 }
 
+// Diagnostic-only workload. Never runs inside the timed benchmark rounds.
+#[cfg(target_os="macos")]
+fn profile_chrome(operation: &str) {
+    use herdr_webview_adapter::chrome_cdp::{Client, discover};
+    use std::{io::{self, Write}, time::Duration};
+    let url = std::env::var("PERF_FIXTURE_URL").unwrap();
+    let profile = std::path::PathBuf::from(std::env::var_os("PERF_PROFILE").unwrap());
+    let client = Client::start(&discover().unwrap(), &profile).unwrap();
+    let pane = if operation == "session_first_frame" {
+        None
+    } else {
+        Some(client.open(&url).unwrap())
+    };
+    let expected = "x".repeat(1_048_576);
+    println!("PROFILE_READY");
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
+    let mut count = 0;
+    while start.elapsed() < Duration::from_secs(6) && count < 4096 {
+        match operation {
+            "session_first_frame" => {
+                let session = client.open(&url).unwrap();
+                assert_eq!(session.eval("document.title").unwrap(), "Herdr performance fixture");
+                let frame = session.frame_timeout(Duration::from_secs(10)).unwrap();
+                assert!(frame.starts_with(b"\x89PNG\r\n\x1a\n"));
+                let target = session.target.clone();
+                drop(session);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let targets = client.request("Target.getTargets", json!({}), None).unwrap();
+                    if !targets["targetInfos"].as_array().unwrap().iter().any(|t| t["targetId"].as_str() == Some(target.as_str())) { break; }
+                    assert!(Instant::now() < deadline, "profile target not closed");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            "screenshot" => {
+                let png = pane.as_ref().unwrap().screenshot().unwrap();
+                assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            }
+            "eval_1mib" => {
+                let value = pane.as_ref().unwrap().eval("'x'.repeat(1048576)").unwrap();
+                assert_eq!(value.as_str(), Some(expected.as_str()));
+            }
+            _ => panic!("unsupported profile operation"),
+        }
+        count += 1;
+    }
+    println!("PROFILE_RESULT {}", json!({"operations":count,"elapsed_ms":start.elapsed().as_secs_f64()*1000.0}));
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("portable") => portable(),
         #[cfg(target_os="macos")]
         Some("chrome") => chrome(),
+        #[cfg(target_os="macos")]
+        Some("profile_chrome") => profile_chrome(&std::env::args().nth(2).expect("profile operation")),
         _ => panic!("unknown benchmark suite"),
     }
 }
