@@ -585,12 +585,22 @@ mod tests {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
-                        let n = connection.read(&mut request).unwrap_or(0);
+                        // TCP may split a request line between reads. Read the
+                        // bounded complete headers, not a single arbitrary chunk.
+                        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut n = 0;
+                        while n < request.len() && !request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            match connection.read(&mut request[n..]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => n += count,
+                            }
+                        }
+                        if !request[..n].windows(4).any(|w| w == b"\r\n\r\n") { continue }
                         // A parser-blocking script keeps readyState at "loading" while
                         // the actual target exists, exercising readiness wakeups.
                         if request[..n].starts_with(b"GET /delayed.js ") {
                             std::thread::sleep(Duration::from_millis(250));
-                            let body = "document.title = 'Herdr delayed fixture';";
+                            let body = "window.__herdrDelayedScriptRan = true; document.title = 'Herdr delayed fixture';";
                             let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                             continue;
                         }
@@ -710,9 +720,19 @@ mod tests {
         drop(pane);
         let delayed = client.open(&format!("http://{address}/delayed"))
             .expect("delayed document must become interactive before screencast");
-        let state = delayed.eval("({title:document.title,ready:document.readyState})").unwrap();
+        let state = delayed.eval("({href:location.href,ready:document.readyState})").unwrap();
+        assert_eq!(state["href"], format!("http://{address}/delayed"));
         assert!(matches!(state["ready"].as_str(), Some("interactive" | "complete")));
-        assert_eq!(state["title"], "Herdr delayed fixture");
+        // The public open contract is an interactive document, not a particular
+        // application title. Independently require that the real delayed script
+        // executes; a missing or misrouted response still fails the test.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = delayed.eval("({title:document.title,ran:window.__herdrDelayedScriptRan===true})").unwrap();
+            if state["ran"] == true && state["title"] == "Herdr delayed fixture" { break }
+            assert!(Instant::now() < deadline, "delayed script did not execute: {state}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(delayed.frame_timeout(Duration::from_secs(10)).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
         drop(delayed);
         drop(client);
