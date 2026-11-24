@@ -65,9 +65,10 @@ def current_pr(pr, run, suites, repo):
     return True
 
 def newest_run(run, repo):
-    query = urlencode({"head_sha": run["head_sha"], "event": run["event"], "per_page": 100})
+    query = urlencode({"head_sha": run["head_sha"], "per_page": 100})
     latest = api(f"repos/{repo}/actions/workflows/performance.yml/runs?{query}")["workflow_runs"]
-    matched = [r for r in latest if r.get("head_sha") == run["head_sha"] and r.get("head_branch") == run["head_branch"]]
+    matched = [r for r in latest if r.get("head_sha") == run["head_sha"] and r.get("head_branch") == run["head_branch"]
+               and r.get("event") in ("pull_request", "workflow_dispatch")]
     if not matched:
         return False
     newest = max(matched, key=lambda r: (r["run_number"], r["run_attempt"]))
