@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   experiment:
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -26,7 +26,7 @@ jobs:
           set -euo pipefail
           mkdir -p probe-report
           git rev-parse HEAD > probe-report/revision.txt
-          sw_vers > probe-report/environment.txt
+          uname -a > probe-report/environment.txt
           python3 -m unittest discover -s scripts -p test_adaptive_idle_ttl.py -v
           python3 scripts/adaptive_idle_ttl.py --out probe-report/ttl-replay.json | tee probe-report/summary.txt
       - uses: actions/upload-artifact@v4
