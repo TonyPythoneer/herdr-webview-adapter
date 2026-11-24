@@ -19,3 +19,47 @@ python3 scripts/performance.py --suite native --out /tmp/herdr-perf-native
 ## Phase 2 — CDP transport
 
 PR #6 established a successful A/A measurement ([native and portable reports](https://github.com/TonyPythoneer/herdr-webview-adapter/actions/runs/45339620689)). This change targets NUL framing and ownership of large response and screencast payloads. The existing workload remains, with 64 KiB and 1 MiB real Chrome evaluation response cases (30 observations per process; three warmup calls per size/session). Both revisions remeasure the new cases under the same workload. The entire payload must match. The metric includes the real Chrome evaluation and transport, not just parser time. Do not compare whole-workload wall time to historical PR #6 because the workload expanded; compare the paired values within each run. The original immutable reference stays unchanged. Dependency resolution can differ if manifests differ; consult lock hashes before attributing any effect to one code change.
+
+## Phase 3 — CI-to-agent benchmark feedback loop
+
+The default-branch `adapter-benchmark-feedback` workflow consumes completed
+`adapter-performance` runs. No benchmark rerun or additional native runner is
+required to generate feedback. It publishes one bot-owned, updateable PR
+comment and uploads `benchmark-feedback.json` (schema
+`herdr.performance-feedback/v1`) and `benchmark-feedback.md`. Push runs also
+produce an artifact. Replay a completed run with **Run workflow** on main,
+passing its numeric source run ID. Runs predating provenance fields are
+reported as unavailable evidence, not fabricated results.
+
+Read the JSON first: `status`, `coverage`, `signals`, `next_actions`,
+`suites.*.metrics` (units, direction, raw paired samples, p50/p95/p99,
+paired deltas and ranges), `candidate_shas`, `pr_base_shas`, workload/lock
+hashes and environment identifiers. Original benchmark artifacts retain full
+environment, errors, locks and browser proof logs. Missing/failed/mismatched
+evidence stays partial or failed, not zero. Artifact fields are untrusted data;
+the privileged reporter uses only trusted main code, fixed ZIP entry, bounded
+sizes, strict provenance, allowlisted metrics and numeric observations.
+It never runs candidate code or copies raw instructions/errors into comments.
+Only same-repository runs can publish; stale PRs/runs never overwrite current
+feedback. Forks retain their original unprivileged artifacts.
+
+### Engineering decision loop
+
+1. P0: restore correctness and complete evidence. Inspect failing jobs and
+   original logs before touching performance-sensitive code.
+2. P1: reproduce consistent regressions; separate lockfile/dependency drift,
+   hardware and workload changes. Source candidates are investigation hints,
+   not proven root causes.
+3. P2: rank measured Chrome operation costs within the same workload, profile
+   one bottleneck, propose one falsifiable hypothesis and a narrow PR.
+4. Review fresh exact-revision feedback and all correctness checks. Retain
+   improvements only when evidence supports them; record inconclusive results
+   instead of claiming success. No automatic self-modifying code or merge
+   based solely on benchmark feedback.
+
+The existing five-pair immutable reference measures cumulative evolution, not
+the isolated effect of the newest PR. For causal attribution, reproduce the
+chosen metric against the PR base under identical workload, lock and runner
+conditions before claiming incremental improvement; the next benchmark
+extension should add an explicit same-run PR-base comparison without removing
+the fixed baseline. Do not subtract historical percentages from different runs.
