@@ -20,3 +20,15 @@ class ComparisonTests(unittest.TestCase):
         pair["candidate"]["meta"]={"chrome_version":"different"}
         with self.assertRaises(RuntimeError):
             p.compare([pair]*p.PAIRS,"test")
+
+class NativeProofTests(unittest.TestCase):
+    def test_pixel_missing_final_proof_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "WK_PIXEL_VERIFIED"):
+            p.require_native_proof("wk_native_pixels", "native WKWebView screenshot pixel test passed")
+    def test_pixel_complete_proof(self):
+        p.require_native_proof("wk_native_pixels", "native WKWebView screenshot pixel test passed\nWK_PIXEL_VERIFIED:")
+    def test_input_missing_proof_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "WK_TRUSTED_WHEEL_VERIFIED"):
+            p.require_native_proof("wk_native_input", "WK_TRUSTED_INPUT_VERIFIED:")
+    def test_input_complete_proof(self):
+        p.require_native_proof("wk_native_input", "WK_TRUSTED_KEY_VERIFIED:\nWK_TRUSTED_TEXT_VERIFIED:\nWK_TRUSTED_WHEEL_VERIFIED:\nWK_TRUSTED_INPUT_VERIFIED:")

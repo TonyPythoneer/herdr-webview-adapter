@@ -10,7 +10,7 @@ use herdr_webview_adapter::{app_home as mods, wk_native};
 mod mac {
     use gpui::{prelude::*, *};
     use std::{io::{Read, Write}, net::TcpListener, path::PathBuf,
-        sync::mpsc, time::Duration};
+        sync::mpsc, time::{Duration, Instant}};
 
     use crate::{mods, wk_native};
 
@@ -27,11 +27,52 @@ mod mac {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/",listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("WebKit fixture request");
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut buffer = [0u8; 4096];
-            let count = stream.read(&mut buffer).unwrap_or(0);
-            assert!(String::from_utf8_lossy(&buffer[..count]).starts_with("GET / HTTP/1.1"));
+            // WebKit can preconnect, request the favicon first, or split an
+            // HTTP request line across multiple reads. A single read() is
+            // never a reliable request parser. Keep the fixture bounded and
+            // serve the main document only after an actual GET / request.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                assert!(Instant::now() < deadline, "WK fixture never received GET /");
+                let (mut conn, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("WK fixture accept failed: {error}"),
+                };
+                conn.set_nonblocking(true).expect("WK fixture must not block on preconnect");
+                let mut request = Vec::new();
+                let request_deadline = Instant::now() + Duration::from_secs(2);
+                while request.len() < 4096 && Instant::now() < request_deadline {
+                    let mut chunk = [0u8; 512];
+                    match conn.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&chunk[..n]);
+                            if request.contains(&b'\n') { break; }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(error) => {
+                            eprintln!("WK fixture request read failed: {error}");
+                            break;
+                        }
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request);
+                let first_line = first_line.lines().next().unwrap_or("").trim_end_matches('\r');
+                if first_line == "GET / HTTP/1.1" {
+                    conn.set_nonblocking(false).unwrap();
+                    break conn;
+                }
+                eprintln!("WK fixture ignored auxiliary/disconnected request: {first_line:?}");
+                let _ = conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            };
             let html = r#"<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
 <body style="margin:0;background:rgb(20,40,60);">
 <div id="tile" style="background:rgb(255,0,0);width:100px;height:100px"></div>
@@ -87,7 +128,7 @@ mod mac {
         if pixels < 100 {
             return Err(format!("native WKWebView screenshot missing red fixture tile; red pixels={pixels}"));
         }
-        println!("native WKWebView screenshot pixel test passed: {}x{}, {pixels} red pixels",
+        eprintln!("native WKWebView screenshot pixel test passed: {}x{}, {pixels} red pixels",
             image.width(),image.height());
         Ok(())
     }
@@ -95,7 +136,6 @@ mod mac {
     pub fn run() {
         assert!(std::env::var_os("HERDR_APP_HOME").is_some(), "native screenshot E2E must set an isolated HERDR_APP_HOME");
         let (url, server)=fixture();
-        let (report_tx,report_rx)=mpsc::channel();
         gpui_platform::application().run(move |cx| {
             let mut view_slot=None;
             let window=cx.open_window(WindowOptions {
@@ -112,16 +152,23 @@ mod mac {
                 cx.new(|_|Scene{web})
             }).expect("GPUI native test window");
             let web=view_slot.expect("WKWebView entity");
+            cx.activate(true);
             cx.spawn(async move |cx| {
-                let outcome=e2e(web,window,cx).await;
-                let _=report_tx.send(outcome);
-                cx.update(|cx|cx.quit());
+                // AppKit may terminate during quit(); verify before exiting.
+                match e2e(web,window,cx).await {
+                    Ok(()) => {
+                        eprintln!("WK_PIXEL_VERIFIED: native snapshot contains fixture pixels");
+                        std::process::exit(0);
+                    }
+                    Err(error) => {
+                        eprintln!("WK_PIXEL_FAILED: {error}");
+                        std::process::exit(1);
+                    }
+                }
             }).detach();
         });
-        // Never silently succeed if a scheduled task crashed or was cancelled.
-        report_rx.recv_timeout(Duration::from_secs(50))
-            .expect("WK native E2E task did not complete").unwrap();
-        server.join().expect("fixture HTTP server failed");
+        let _ = server;
+        panic!("WK_PIXEL_FAILED: AppKit exited before proof completed");
     }
 }
 

@@ -76,6 +76,16 @@ def rss_tree(pid):
         owned |= new
     return rows.get(pid, (0, 0))[1], sum(rows[p][1] for p in owned - {pid} if p in rows)
 
+def require_native_proof(suite, log_text):
+    markers = {
+        "wk_native_pixels": ("native WKWebView screenshot pixel test passed", "WK_PIXEL_VERIFIED:"),
+        "wk_native_input": ("WK_TRUSTED_KEY_VERIFIED:", "WK_TRUSTED_TEXT_VERIFIED:",
+                            "WK_TRUSTED_WHEEL_VERIFIED:", "WK_TRUSTED_INPUT_VERIFIED:"),
+    }
+    missing = [marker for marker in markers[suite] if marker not in log_text]
+    if missing:
+        raise RuntimeError(f"native test did not prove actual browser behavior: missing {missing}")
+
 def measure(binary, suite, work, url, log):
     env = dict(os.environ, HERDR_APP_HOME=str(work / "app"), PERF_PROFILE=str(work / "profile"), PERF_FIXTURE_URL=url)
     env.pop("HERDR_WK_NATIVE_SMOKE", None)
@@ -116,11 +126,13 @@ def measure(binary, suite, work, url, log):
             if monitor:
                 monitor.join()
     elapsed = (time.monotonic() - start) * 1000
+    log_text = log.read_text(errors="replace")
     if code:
+        print(f"FAILED {log.name} (exit {code}):\n{log_text[-16000:]}", flush=True)
         raise RuntimeError(f"{suite} exited {code}; see {log.name}")
     result = collections.defaultdict(list)
     meta = {}
-    for line in log.read_text(errors="replace").splitlines():
+    for line in log_text.splitlines():
         if line.startswith("PERF "):
             row = json.loads(line[5:])
             value = row["ms"]
@@ -136,9 +148,11 @@ def measure(binary, suite, work, url, log):
         if any(len(result[k+"_ms"]) != n for k,n in expected.items()) or not meta.get("chrome_version"):
             raise RuntimeError("incomplete real Chrome workload")
     if suite.startswith("wk_"):
-        marker = "native WKWebView screenshot pixel test passed" if suite.endswith("pixels") else "WK_TRUSTED_WHEEL_VERIFIED"
-        if marker not in log.read_text(errors="replace"):
-            raise RuntimeError("native test did not prove actual browser behavior")
+        try:
+            require_native_proof(suite, log_text)
+        except RuntimeError as exc:
+            print(f"FAILED {log.name}:\n{log_text[-16000:]}", flush=True)
+            raise RuntimeError(f"{log.name}: {exc}") from exc
     if suite != "portable":
         result[suite + "_workload_wall_ms"].append(elapsed)
         # Process-group CPU accounting includes sampler ps commands; label accordingly.
@@ -261,6 +275,7 @@ def main():
                         work=tmp/f"{suite}-{i}-{side}"
                         work.mkdir()
                         binary=bins[side]["perf_fixed" if suite in ("portable","chrome") else "perf_"+suite]
+                        print(f"Measuring {suite} pair {i+1}/{PAIRS} {side}", flush=True)
                         samples,meta=measure(binary,suite,work,url,out/f"{suite}-{i}-{side}.log")
                         pair[side]={"samples":samples,"meta":meta}
                     rounds.append(pair)
