@@ -55,14 +55,12 @@ impl ChromeView {
                         this._frames = Some(cx.spawn(async move |this, cx| {
                             loop {
                                 let reader = receiver.clone();
-                                let result = cx.background_executor().spawn(async move {
-                                    reader.frame_timeout(Duration::from_millis(800))
+                                // Return only the paint-ready image to the foreground.
+                                let decoded = cx.background_executor().spawn(async move {
+                                    let frame = reader.frame_timeout(Duration::from_millis(800))?;
+                                    decode_frame(&frame)
                                 }).await;
-                                let Ok(frame) = result else {
-                                    if this.upgrade().is_none() { break }
-                                    continue;
-                                };
-                                let decoded = cx.background_executor().spawn(async move {decode_frame(&frame)}).await;
+                                if decoded.is_err() && this.upgrade().is_none() { break }
                                 if let Ok(frame) = decoded
                                     && this.update(cx, |this, cx| {
                                         this.frame = Some(frame);
@@ -254,7 +252,7 @@ fn decode_frame(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
     }
     let mut image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
         .map_err(|e| format!("Chrome PNG decode failed: {e}"))?
-        .to_rgba8();
+        .into_rgba8();
     // gpui-pre's atlas expects BGRA byte ordering, unlike PNG's RGBA.
     for pixel in image.chunks_exact_mut(4) { pixel.swap(0, 2) }
     Ok(Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(image)])))
