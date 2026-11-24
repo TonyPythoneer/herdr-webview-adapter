@@ -467,6 +467,16 @@ pub struct Session {
     frames: Mutex<Receiver<String>>,
 }
 
+fn decode_frame_into(encoded: &str, bytes: &mut Vec<u8>) -> Result<(), String> {
+    bytes.clear();
+    if encoded.len() > MAX_FRAME_BASE64 { return Err("Chrome screencast frame is too large".into()); }
+    if let Err(e) = base64::engine::general_purpose::STANDARD.decode_vec(encoded, bytes) {
+        bytes.clear();
+        return Err(format!("invalid Chrome screencast frame: {e}"));
+    }
+    Ok(())
+}
+
 impl Session {
     pub fn post(&self, name: &str, params: Value) -> Result<(), String> {
         self.client.send(name, params, Some(&self.session))
@@ -517,10 +527,17 @@ impl Session {
     }
 
     pub fn frame_timeout(&self, timeout: Duration) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.frame_timeout_into(timeout, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Reuse caller-owned scratch space without retaining pixels across sessions.
+    pub fn frame_timeout_into(&self, timeout: Duration, bytes: &mut Vec<u8>) -> Result<(), String> {
+        bytes.clear();
         let encoded = self.frames.lock().unwrap().recv_timeout(timeout)
             .map_err(|e| format!("Chrome screencast frame unavailable: {e}"))?;
-        base64::engine::general_purpose::STANDARD.decode(encoded)
-            .map_err(|e| format!("invalid Chrome screencast frame: {e}"))
+        decode_frame_into(&encoded, bytes)
     }
 
     pub fn click_at(&self, x: f64, y: f64) -> Result<(), String> {
@@ -578,6 +595,18 @@ pub fn persistent_profile() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scratch_reuse_has_no_stale_bytes_after_short_or_invalid_frame() {
+        let mut bytes=Vec::new();
+        decode_frame_into("YWJjZGVm",&mut bytes).unwrap();
+        assert_eq!(bytes,b"abcdef");
+        let capacity=bytes.capacity();
+        decode_frame_into("YQ==",&mut bytes).unwrap();
+        assert_eq!(bytes,b"a");
+        assert_eq!(bytes.capacity(),capacity);
+        assert!(decode_frame_into("!!!!",&mut bytes).is_err());
+        assert!(bytes.is_empty());
+    }
 
     #[test]
     fn discovery_reuses_only_recent_success_for_same_executable() {
