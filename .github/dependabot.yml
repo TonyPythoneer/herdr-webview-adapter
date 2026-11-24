@@ -15,3 +15,10 @@ updates:
           - patch
     # Version changes that disrupt GPUI/WKWebView must fail the compatibility
     # gate and require a real native-app Host E2E before downstream promotion.
+    # These exact pins form the Host/Adapter GPUI type compatibility boundary.
+    # Upgrade them together in an audited maintainer PR after Host migration.
+    ignore:
+      - dependency-name: gpui-pre
+      - dependency-name: gpui-pre-platform
+      - dependency-name: gpui-wry
+      - dependency-name: lb-wry
