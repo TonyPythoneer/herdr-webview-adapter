@@ -144,7 +144,7 @@ def measure(binary, suite, work, url, log):
     if suite == "portable" and any(len(result[k]) != 100 for k in ("url_policy_5000_calls_ms", "engine_policy_2000_calls_ms")):
         raise RuntimeError("incomplete portable samples")
     if suite == "chrome":
-        expected = {"chrome_client_start":1,"chrome_session_open":3,"chrome_first_frame_receive":3,"chrome_query":60,"chrome_eval_roundtrip":60,"chrome_click_to_dom_observed":15,"chrome_screenshot_png":15,"chrome_session_close_confirmed":3,"chrome_client_shutdown":1}
+        expected = {"chrome_client_start":1,"chrome_session_open":3,"chrome_first_frame_receive":3,"chrome_query":60,"chrome_eval_roundtrip":60,"chrome_eval_64kib":30,"chrome_eval_1mib":30,"chrome_click_to_dom_observed":15,"chrome_screenshot_png":15,"chrome_session_close_confirmed":3,"chrome_client_shutdown":1}
         if any(len(result[k+"_ms"]) != n for k,n in expected.items()) or not meta.get("chrome_version"):
             raise RuntimeError("incomplete real Chrome workload")
     if suite.startswith("wk_"):
@@ -218,6 +218,7 @@ def report(data, out):
         lines += ["","## Errors"]+["- "+str(e).replace("\n"," ") for e in data["errors"]]
     content="\n".join(lines)+"\n"
     (out/"performance.md").write_text(content)
+    print(content, flush=True)
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
             f.write(content)

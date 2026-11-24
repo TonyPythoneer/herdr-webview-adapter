@@ -1,12 +1,14 @@
 //! Private local Chrome CDP transport, over Chromium's fd 3/4 pipe protocol.
 //! No debugging TCP port, no bundled Chrome, and no access to the daily profile.
 //! This module is macOS-only. Chrome owns a private profile inside Herdr's home.
+mod framing;
+
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, BufReader, Read, Write},
     os::{fd::{FromRawFd, RawFd}, unix::{fs::PermissionsExt, process::CommandExt}},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -229,13 +231,13 @@ impl Client {
         self.write_message(id, method, params, session)
     }
 
-    fn received(&self, message: Value) {
+    fn received(&self, mut message: Value) {
         if let Some(id) = message.get("id").and_then(Value::as_u64) {
             if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
                 let result = if let Some(error) = message.get("error") {
                     Err(format!("CDP_ERROR: {error}"))
                 } else {
-                    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                    Ok(message.get_mut("result").map(Value::take).unwrap_or(Value::Null))
                 };
                 let _ = tx.send(result);
             }
@@ -244,20 +246,20 @@ impl Client {
         if message.get("method").and_then(Value::as_str) != Some("Page.screencastFrame") {
             return;
         }
-        let Some(session) = message.get("sessionId").and_then(Value::as_str) else { return };
-        let Some(params) = message.get("params") else { return };
+        let Some(Value::String(session)) = message.get_mut("sessionId").map(Value::take) else { return };
+        let Some(params) = message.get_mut("params") else { return };
         if let Some(frame_id) = params.get("sessionId").and_then(Value::as_i64) {
             // Never block the only CDP reader on a write into Chrome's pipe.
             // Even discarded frames need ACKs to keep the screencast moving.
-            let _ = self.frame_acks.send((session.to_owned(), frame_id));
+            let _ = self.frame_acks.send((session.clone(), frame_id));
         }
-        let Some(data) = params.get("data").and_then(Value::as_str) else { return };
+        let Some(Value::String(data)) = params.get_mut("data").map(Value::take) else { return };
         if data.len() > MAX_FRAME_BASE64 { return }
-        let sender = self.frames.lock().unwrap().get(session).cloned();
+        let sender = self.frames.lock().unwrap().get(&session).cloned();
         if let Some(sender) = sender {
-            // Decoding a high-frequency PNG here delays unrelated CDP replies.
-            // Only enqueue bounded encoded data; the frame consumer decodes it.
-            let _ = sender.try_send(data.to_owned());
+            // Transfer ownership of the bounded encoded payload. No extra
+            // full-frame copy and no PNG decoding on the pipe-reader thread.
+            let _ = sender.try_send(data);
         }
     }
 
@@ -353,26 +355,16 @@ impl Drop for Client {
     }
 }
 
-fn read_messages(mut reader: File, client: Weak<Client>) {
-    let mut chunk = [0u8; 32768];
-    let mut buffer = Vec::<u8>::new();
-    'read: loop {
-        let Ok(read) = reader.read(&mut chunk) else { break };
-        if read == 0 { break }
-        for byte in &chunk[..read] {
-            if *byte != 0 {
-                buffer.push(*byte);
-                // Fall through to the disconnect path below so in-flight
-                // requests fail immediately instead of timing out one by one.
-                if buffer.len() > MAX_MESSAGE { break 'read }
-                continue;
-            }
-            if let Ok(value) = serde_json::from_slice(&buffer)
-                && let Some(client) = client.upgrade()
-            {
-                client.received(value);
-            }
-            buffer.clear();
+fn read_messages(reader: File, client: Weak<Client>) {
+    let mut reader = BufReader::with_capacity(32 * 1024, reader);
+    let mut buffer = Vec::new();
+    // Frame parsing is independent from routing and never writes to Chrome.
+    // EOF, an oversized message or an I/O error all reach disconnect cleanup.
+    while let Ok(true) = framing::read_message(&mut reader, &mut buffer, MAX_MESSAGE) {
+        if let Ok(value) = serde_json::from_slice(&buffer)
+            && let Some(client) = client.upgrade()
+        {
+            client.received(value);
         }
     }
     if let Some(client) = client.upgrade() {
@@ -419,13 +411,14 @@ impl Session {
     }
 
     pub fn eval(&self, expression: &str) -> Result<Value, String> {
-        let result = self.command("Runtime.evaluate", json!({
+        let mut result = self.command("Runtime.evaluate", json!({
             "expression":expression,"returnByValue":true,"awaitPromise":true,
         }))?;
         if let Some(error) = result.get("exceptionDetails") {
             return Err(format!("CDP_EVAL_FAILED: {error}"));
         }
-        Ok(result["result"].get("value").cloned().unwrap_or(Value::Null))
+        Ok(result.get_mut("result").and_then(|r| r.get_mut("value"))
+            .map(Value::take).unwrap_or(Value::Null))
     }
 
     pub fn screenshot(&self) -> Result<Vec<u8>, String> {
