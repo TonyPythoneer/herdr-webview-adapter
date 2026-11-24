@@ -36,13 +36,22 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/herdr-perf-target
         run: |
           set -euo pipefail
+          cleanup_profile() {
+            local dir="$1"
+            for attempt in 1 2 3 4 5; do
+              if rm -rf -- "$dir"; then return 0; fi
+              sleep 1
+            done
+            echo "::error::Temporary Chrome profile could not be removed: $dir"
+            return 1
+          }
           mkdir -p probe-report
           git rev-parse HEAD > probe-report/revision.txt
           sw_vers > probe-report/environment.txt
           cargo build --release --example chrome_gpu_backend
           cp Cargo.lock probe-report/Cargo.lock
           D="$(mktemp -d)"
-          trap 'rm -rf "$D"' EXIT
+          trap 'status=$?; cleanup_profile "$D" || { if [ "$status" -eq 0 ]; then status=1; fi; }; exit "$status"' EXIT
           HERDR_APP_HOME="$D" HERDR_CHROME_BINARY="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$CARGO_TARGET_DIR/release/examples/chrome_gpu_backend" | tee probe-report/chrome-gpu.json
       - uses: actions/upload-artifact@v4
         if: always()
