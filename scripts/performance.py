@@ -292,6 +292,60 @@ def compare(rounds, suite):
         rows.append({"metric":key,"baseline":a,"candidate":b,"paired_delta_pct":delta,"pair_deltas_pct":changes,"classification":label})
     return rows
 
+def user_latency_samples(samples):
+    """Measured segment sums, not continuous wall clock or GPUI presentation."""
+    start = samples["chrome_client_start_ms"]
+    opens = samples["chrome_session_open_ms"]
+    frames = samples["chrome_first_frame_receive_ms"]
+    if len(start) != 1 or len(opens) != 3 or len(frames) != 3:
+        raise RuntimeError("incomplete open-to-frame observations")
+    return {"cold_start_open_frame_segments_ms": [start[0] + opens[0] + frames[0]],
+            "warm_open_frame_segments_ms": [o + f for o, f in zip(opens[1:], frames[1:])]}
+
+def measure_discovery(binary, log, expected_version):
+    proc = subprocess.run([str(binary), "discovery"], capture_output=True, text=True, timeout=60)
+    log.write_text(proc.stdout + proc.stderr)
+    proc.check_returncode()
+    samples = collections.defaultdict(list)
+    meta = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("PERF "):
+            row = json.loads(line[5:])
+            value = row["ms"]
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise RuntimeError("invalid discovery observation")
+            samples[row["metric"] + "_ms"].append(value)
+        elif line.startswith("PERF_META "):
+            meta.update(json.loads(line[10:]))
+    expected = {"chrome_discovery_cold_ms": 1, "chrome_discovery_repeat_ms": 4}
+    if set(samples) != set(expected) or any(len(samples[k]) != n for k, n in expected.items()):
+        raise RuntimeError("incomplete discovery observations")
+    if meta.get("chrome_version") != expected_version:
+        raise RuntimeError("discovery version differs from timed Chrome workload")
+    return dict(samples)
+
+def user_latency_report(data, bins, out, distinct_base, pr_base):
+    rounds = []
+    for i, original in enumerate(data["rounds"]["chrome"]):
+        pair = {}
+        for side in round_order(i, distinct_base):
+            record = original[side]
+            samples = user_latency_samples(record["samples"])
+            samples.update(measure_discovery(bins[side]["perf_fixed"], out / f"discovery-{i}-{side}.log",
+                                             record["meta"]["chrome_version"]))
+            pair[side] = {"samples": samples, "meta": record["meta"]}
+        if pr_base == BASELINE:
+            pair["pr_base"] = pair["baseline"]
+        rounds.append(pair)
+    result = {"schema": 1, "candidate_sha": data["candidate_sha"],
+              "baseline_sha": data["baseline_sha"], "pr_base_sha": pr_base,
+              "workload_sha256": data["workload_sha256"], "lock_sha256": data["lock_sha256"],
+              "scope": "segment sums exclude discovery, intermediate eval, GPUI and presentation; discovery measured separately",
+              "rounds": rounds, "comparison": compare(comparison_pairs(rounds, "baseline"), "user_latency"),
+              "incremental_comparison": compare(comparison_pairs(rounds, "pr_base"), "user_latency") if pr_base else []}
+    (out / "user-latency.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+    return result
+
 def report(data, out):
     (out/"performance.json").write_text(json.dumps(data,indent=2,allow_nan=False)+"\n")
     lines=["# Adapter performance comparison","",f"Status: **{data['status']}**", "",f"Baseline: `{data['baseline_sha']}`",f"Candidate: `{data['candidate_sha']}`","",f"Runner: {data['environment']}", "",
@@ -309,6 +363,14 @@ def report(data, out):
             for r in rows:
                 delta="N/A" if r["paired_delta_pct"] is None else f"{r['paired_delta_pct']:+.1f}%"
                 lines.append(f"| {r['metric']} | {r['baseline']['p50']:.4g} | {r['candidate']['p50']:.4g} | {delta} | {r['classification']} |")
+    user_latency = data.get("user_latency")
+    if user_latency:
+        lines += ["", "## User latency diagnostics", "",
+                  "Cold/warm values sum measured start/open/receive segments; not full wall clock or visible GPUI paint. Discovery uses separate fresh processes after all timed workloads. See user-latency.json for raw paired samples.", "",
+                  "| Metric | Reference p50 | Candidate p50 | Paired delta | Signal |", "|---|---:|---:|---:|---|"]
+        for r in user_latency.get("incremental_comparison") or user_latency["comparison"]:
+            delta = "N/A" if r["paired_delta_pct"] is None else f"{r['paired_delta_pct']:+.1f}%"
+            lines.append(f"| {r['metric']} | {r['baseline']['p50']:.4g} | {r['candidate']['p50']:.4g} | {delta} | {r['classification']} |")
     timings=data.get("execution_timing_seconds",{})
     if timings:
         lines += ["","## CI execution timing (not benchmark metrics)","",
@@ -448,6 +510,8 @@ def main():
                 elapsed=time.monotonic()-measurement_started
                 data["execution_timing_seconds"]["measurement"][suite]=elapsed
                 print(f"CI_MEASUREMENT_TIMING {suite} {elapsed:.3f}s",flush=True)
+            if native:
+                data["user_latency"] = user_latency_report(data, bins, out, distinct_base, pr_base)
             data["status"]="measured"
             # Only after every timed measurement and native proof succeeds.
             # Profiling is diagnostic, never part of the comparison or correctness gate.
