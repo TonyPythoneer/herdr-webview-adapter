@@ -142,8 +142,16 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
     check(isinstance(env, dict), "invalid environment")
     # Only constrained identifiers enter agent-facing feedback; full environment
     # and free-text error evidence stay in the original untrusted artifact.
-    safe_env = {k: v for k, v in env.items() if k in ("runner_os", "machine", "runner_image", "hardware")
-                and isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_. ,+-]{1,80}", v)}
+    safe_env = {}
+    for key, allowed in (("runner_os", ("Linux", "macOS", "Windows")),
+                         ("machine", ("x86_64", "arm64", "aarch64", "AMD64"))):
+        if env.get(key) in allowed:
+            safe_env[key] = env[key]
+    for key, pattern in (("runner_image", r"[0-9]+(?:[.][0-9]+){0,5}"),
+                         ("hardware", r"Mac(?:BookPro|BookAir|mini|Pro|Studio)?[0-9]+,[0-9]+")):
+        value = env.get(key)
+        if isinstance(value, str) and len(value) <= 40 and re.fullmatch(pattern, value):
+            safe_env[key] = value
     if type(env.get("cpu_count")) is int and 0 < env["cpu_count"] <= 1024:
         safe_env["cpu_count"] = env["cpu_count"]
     safe_env["chrome_versions"] = sorted(browser_versions)
