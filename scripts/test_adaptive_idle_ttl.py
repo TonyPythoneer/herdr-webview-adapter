@@ -13,4 +13,5 @@ class Policy(unittest.TestCase):
         r=replay([1,5,10],lambda _:5)
         self.assertEqual((r["hits"],r["misses"],r["idle_process_seconds"]),(1,2,11))
     def test_recent_window(self):
-        self.assertEqual(adaptive([100]*30+[1]*8),1)
+        self.assertEqual(adaptive([100]*30+[1]*8),1.25)
+        self.assertEqual(adaptive([100]*30+[0]*8),1.0)
