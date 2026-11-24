@@ -324,7 +324,10 @@ impl Client {
         let pane = Session { client: self.clone(), target, session, frames: Mutex::new(rx),
             viewport: Mutex::new(None) };
         pane.command("Page.enable", json!({}))?;
-        pane.command("Runtime.enable", json!({}))?;
+        // Runtime.enable only subscribes to execution-context notifications.
+        // This adapter evaluates directly in the default context and never
+        // consumes those notifications. Runtime.evaluate and debugger resume
+        // do not require the subscription. Avoid that extra round trip.
         // Chrome 144+ may leave a newly attached target waiting for the
         // debugger even after domain enable succeeds. A suspended target can
         // respond to enable/evaluate but never navigate or fetch page content.
@@ -679,6 +682,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(title, "Herdr fixture");
+        // Runtime remains usable without subscribing to context events.
+        assert_eq!(pane.eval("6 * 7").unwrap(), 42);
+        assert_eq!(pane.eval("Promise.resolve(43)").unwrap(), 43);
         let frame = pane.frame_timeout(Duration::from_secs(10)).expect("headless CDP must emit real screencast frames");
         assert!(frame.starts_with(b"\x89PNG\r\n\x1a\n"), "screencast must be PNG");
         let png = pane.screenshot().unwrap();
