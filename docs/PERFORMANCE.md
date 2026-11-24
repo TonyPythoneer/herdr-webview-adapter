@@ -149,3 +149,37 @@ contention would invalidate comparisons. Native UI tests also retain their
 existing isolation. If measurement time later dominates, split independent
 workloads across isolated runners, keeping each workload's three revisions on
 the same machine. No correctness or native proof gate is removed.
+
+### All-platform cache layers
+
+Both correctness and benchmark workflows restore Rust registry/git sources,
+Cargo target outputs and a bounded 512 MiB local sccache store on both Ubuntu
+and macOS. A pinned sccache version is enabled only after successful setup;
+compiler stats are logged and the benchmark records JSON statistics before
+timed measurements. GitHub cache scopes isolate PR caches from trusted main.
+The dev/test and release stores are separated. Cargo still checks its
+dependency fingerprints and all correctness tests execute every run.
+
+The benchmark additionally stores exact-revision executables in a
+content-addressed cache, keyed by revision SHA, actual resolved lock SHA-256,
+all workload/fixture bytes, build/cache scripts, Rust/Cargo/compiler and SDK
+versions, OS/architecture/runner image and relevant build flags. A hit verifies
+each executable's hash, manifest and executable bit, then snapshots it into
+the revision's fresh run directory. A mismatch or damaged entry rebuilds.
+Unknown runner images disable persistent binary reuse. Entries are bounded to
+eight revisions and 350 MiB total; old entries are evicted. The three immutable
+Rust fixture sources and static local HTML are likewise content-addressed,
+validated against current bytes and reused in the same archive. No browser
+profile, native UI state, external response, test outcome, benchmark sample or
+profiling observation is cached.
+
+A first run populates the stores; reruns and subsequent PRs can reuse matching
+entries. Record exact cache hit, per-revision binary hits, fixture hits and
+stage durations in performance.json and the normalized AI feedback artifact.
+Do not compare cache timings to product performance timings. Shared Cargo
+target still handles misses efficiently. Correctness and five paired
+measurements stay mandatory. The previous cold shared-target run
+45355598936 measured baseline 296.196 s, PR base 40.371 s, candidate 33.333 s
+(369.900 s total), down from roughly 726 s before shared-target reuse.
+Future cold/warm measurements must include cache transfer overhead before
+claiming end-to-end speedup.

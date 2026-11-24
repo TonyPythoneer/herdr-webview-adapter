@@ -216,6 +216,39 @@ def normalize_profile(data, matrix_suite):
             "scope": "candidate_only_diagnostic", "probes": normalized,
             "interpretation": "Collapsed leaf-stack counts include blocked threads, omit low-count symbols and are not CPU time or root-cause proof."}
 
+def normalize_ci_cache(data):
+    # CI optimization measurements are optional, distinct from browser metrics.
+    value = data.get("cache")
+    timing = data.get("execution_timing_seconds", {})
+    result = {"status": "unavailable", "binaries": {}, "fixtures": {}, "execution_timing_seconds": {}}
+    if isinstance(timing, dict):
+        for category, allowed in (("prepare_and_build", ("baseline","pr_base","candidate")),
+                                  ("measurement", ("portable","chrome","wk_native_pixels","wk_native_input"))):
+            rows = timing.get(category, {})
+            if isinstance(rows, dict):
+                result["execution_timing_seconds"][category] = {
+                    k:v for k,v in rows.items() if k in allowed and finite_number(v) and 0 <= v <= 10000}
+        profile_time = timing.get("profiling")
+        if finite_number(profile_time) and 0 <= profile_time <= 10000:
+            result["execution_timing_seconds"]["profiling"] = profile_time
+        cache_hit = timing.get("build_cache_hit")
+        if cache_hit in ("true", "false"):
+            result["compilation_cache_exact_hit"] = cache_hit == "true"
+    if not isinstance(value, dict):
+        return result
+    binaries, fixtures = value.get("binaries"), value.get("fixtures")
+    if not isinstance(binaries, dict) or not isinstance(fixtures, dict):
+        return result
+    allowed_status = ("hit", "miss", "miss_write_failed", "disabled_unknown_environment")
+    for side, entry in binaries.items():
+        if side in ("baseline","pr_base","candidate") and isinstance(entry, dict) and entry.get("status") in allowed_status:
+            result["binaries"][side] = entry["status"]
+    for name, status in fixtures.items():
+        if name in ("workload.rs","wk_native_pixels.rs","wk_native_input.rs","fixture.html") and status in ("hit","miss"):
+            result["fixtures"][name] = status
+    result["status"] = "reported"
+    return result
+
 def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
     """Validate both comparisons against the same measured candidate samples."""
     check(isinstance(data, dict) and data.get("schema") in (1, 2), "unknown source schema")
@@ -224,6 +257,7 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
         result["incremental_status"] = "unavailable" if event == "pull_request" else "not_applicable"
         result["incremental_metrics"] = []
         result["profiling"] = normalize_profile(data, matrix_suite)
+        result["ci_cache"] = normalize_ci_cache(data)
         return result
     reference = data.get("incremental_reference_sha")
     context = data.get("context", {})
@@ -278,6 +312,7 @@ def normalize_suite(data, matrix_suite, run_id, attempt, event, head):
     result["incremental_metrics"] = []
     result["round_order"] = orders
     result["profiling"] = normalize_profile(data, matrix_suite)
+    result["ci_cache"] = normalize_ci_cache(data)
     if reference:
         inc = normalize(incremental, "pr_base")
         result["incremental_status"] = "complete" if inc["status"] == "measured" else "partial_or_failed"
@@ -396,6 +431,14 @@ def render_comment(report, repo, reporter_id):
         lines.append(f"- `{probe['operation']}`: {probe['operations']} verified operations; top collapsed stacks: "
                      + ", ".join(f"{key}={count}" for key, count in top)
                      + f". Raw evidence: `{probe['source_log']}`.")
+    lines += ["", "### CI cache and build cost", "", "| Suite | Binary cache | Fixture hits | Build seconds |", "|---|---|---:|---:|"]
+    for name, suite in sorted(report["suites"].items()):
+        cache = suite.get("ci_cache", {})
+        binary = ", ".join(f"{side}: {status}" for side, status in cache.get("binaries", {}).items()) or "unavailable"
+        fixtures = cache.get("fixtures", {})
+        timing = cache.get("execution_timing_seconds", {}).get("prepare_and_build", {})
+        seconds = f"{sum(timing.values()):.1f}" if timing else "unavailable"
+        lines.append(f"| {name} | {binary} | {sum(v == 'hit' for v in fixtures.values())}/{len(fixtures)} | {seconds} |")
     lines += ["", "### Next engineering actions"]
     for a in report["next_actions"][:6]:
         lines.append(f"- **{a['priority']}** " + (f"`{a['metric']}`: " if "metric" in a else "") + a["action"] + (" (" + ", ".join("`"+p+"`" for p in a["source_candidates"]) + ")" if "source_candidates" in a else ""))

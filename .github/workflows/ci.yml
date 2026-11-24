@@ -23,11 +23,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95.0"
+      - name: Identify build environment
+        id: build-image
+        shell: bash
+        run: printf 'image=%s-%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Restore Rust compilation cache
+        id: build-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target
+            ${{ runner.temp }}/herdr-sccache
+          key: herdr-correctness-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.build-image.outputs.image }}-rust1.95.0-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.cargo/config*', 'rust-toolchain*') }}
+          restore-keys: |
+            herdr-correctness-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.build-image.outputs.image }}-rust1.95.0-
+      - name: Install pinned sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: v0.10.0
+          disable_annotations: 'true'
+      - name: Enable bounded local compiler cache
+        if: steps.sccache.outcome == 'success'
+        shell: bash
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$RUNNER_TEMP/herdr-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=512M" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+      - name: Record cache restore result
+        shell: bash
+        run: echo "Compilation cache exact hit = ${{ steps.build-cache.outputs.cache-hit }}"
       - run: cargo test --all-targets
       - name: Upstream compatibility contract and probe unit tests
         run: |
           python3 -m unittest discover -s scripts -p 'test_upstream_compat.py' -v
           python3 scripts/upstream_compat.py gate .github/upstream-compat.json
+      - name: Compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        shell: bash
+        run: sccache --show-stats || true
 
   macos-native-tests:
     name: macos-native-tests
@@ -37,19 +75,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95.0"
-      - name: Identify native runner image
-        id: native-image
+      - name: Identify build environment
+        id: build-image
         shell: bash
         run: printf 'image=%s-%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - name: Restore native compilation cache
-        id: native-cache
+      - name: Restore Rust compilation cache
+        id: build-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git/db
             target
-          key: herdr-native-test-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-image.outputs.image }}-rust1.95.0-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+            ${{ runner.temp }}/herdr-sccache
+          key: herdr-correctness-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.build-image.outputs.image }}-rust1.95.0-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '.cargo/config*', 'rust-toolchain*') }}
+          restore-keys: |
+            herdr-correctness-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.build-image.outputs.image }}-rust1.95.0-
+      - name: Install pinned sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: v0.10.0
+          disable_annotations: 'true'
+      - name: Enable bounded local compiler cache
+        if: steps.sccache.outcome == 'success'
+        shell: bash
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_DIR=$RUNNER_TEMP/herdr-sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=512M" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+      - name: Record cache restore result
+        shell: bash
+        run: echo "Compilation cache exact hit = ${{ steps.build-cache.outputs.cache-hit }}"
       - name: Run portable, real Chrome CDP, WebKit pixel and trusted native input tests
         env:
           HERDR_APP_HOME: ${{ runner.temp }}/herdr-adapter-native-e2e
@@ -57,3 +116,7 @@ jobs:
           HERDR_WK_NATIVE_INPUT_E2E: "1"
           HERDR_CHROME_E2E: "1"
         run: cargo test --all-targets
+      - name: Compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        shell: bash
+        run: sccache --show-stats || true

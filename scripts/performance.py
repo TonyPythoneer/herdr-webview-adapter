@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import performance_profile as profiler
+import performance_cache as cache
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "acf81de1738bf6ef2e4f6194208eb268e7523842"
@@ -32,9 +33,10 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(FIXTURE)))
+        fixture = getattr(self.server, "fixture", FIXTURE)
+        self.send_header("Content-Length", str(len(fixture)))
         self.end_headers()
-        self.wfile.write(FIXTURE)
+        self.wfile.write(fixture)
     def log_message(self, *_):
         pass
 
@@ -44,15 +46,15 @@ def run(*args, cwd=ROOT):
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def build(tree, native, target, destination):
+def build(tree, native, target, destination, fixtures=None):
     examples = tree / "examples"
     examples.mkdir(exist_ok=True)
-    shutil.copyfile(ROOT / "benchmarks/workload.rs", examples / "perf_fixed.rs")
+    shutil.copyfile(fixtures["workload.rs"] if fixtures else ROOT / "benchmarks/workload.rs", examples / "perf_fixed.rs")
     names = ["perf_fixed"]
     if native:
         for case in ("wk_native_pixels", "wk_native_input"):
             name = "perf_" + case
-            shutil.copyfile(ROOT / "benchmarks" / (case + ".rs"), examples / (name + ".rs"))
+            shutil.copyfile(fixtures[case + ".rs"] if fixtures else ROOT / "benchmarks" / (case + ".rs"), examples / (name + ".rs"))
             names.append(name)
     # Cargo already parallelizes compilation across independent crates. Reuse
     # its dependency artifacts instead of compiling three copies simultaneously.
@@ -76,6 +78,40 @@ def build(tree, native, target, destination):
             raise RuntimeError("benchmark executable snapshot failed verification")
         binaries[name] = snapshot
     return binaries
+
+def build_identity(environment, native):
+    # CI controls the build environment. Fingerprint toolchains, OS/SDK and
+    # relevant flags; an unknown image does not enable persistent binary reuse.
+    tools = {"rust": environment["rust"], "cargo": environment["cargo"],
+             "cc": run("cc", "--version")}
+    if native:
+        tools["sdk"] = run("xcrun", "--show-sdk-version")
+        tools["xcode"] = run("xcodebuild", "-version")
+    else:
+        tools["linker"] = run("ld", "--version")
+    flags = {k: v for k, v in os.environ.items() if k.startswith(("CARGO_PROFILE_", "CARGO_TARGET_", "CARGO_BUILD_", "CFLAGS", "CXXFLAGS", "LDFLAGS", "RUSTFLAGS", "RUSTC", "CARGO_ENCODED_RUSTFLAGS", "MACOSX_DEPLOYMENT_TARGET", "SDKROOT", "CC", "CXX"))}
+    return {"tools": tools, "flags": flags, "os": platform.platform(),
+            "machine": platform.machine(), "image_os": os.getenv("ImageOS"),
+            "image_version": os.getenv("ImageVersion"), "suite": "native" if native else "portable",
+            "build_policy": digest(Path(__file__)), "cache_policy": digest(Path(cache.__file__)), "sccache": run("sccache", "--version") if os.environ.get("RUSTC_WRAPPER") == "sccache" else None}
+
+def build_cached(tree, revision, native, target, destination, store, fixtures, identity, lock):
+    inputs = {"schema": cache.SCHEMA, "revision": revision, "lock": digest(lock),
+              "fixtures": {name: digest(path) for name, path in fixtures.items()}, "build": identity}
+    key = cache.content_key(inputs)
+    enabled = bool(identity.get("image_os") and identity.get("image_version"))
+    if enabled:
+        restored = cache.restore(store, key, cache.binary_names(native), destination)
+        if restored is not None:
+            return restored, "hit", key
+    binaries = build(tree, native, target, destination, fixtures)
+    if enabled:
+        try:
+            cache.save(store, key, binaries)
+        except OSError:
+            print("::warning::Binary cache write failed; freshly built executable will be measured.", flush=True)
+            return binaries, "miss_write_failed", key
+    return binaries, "miss" if enabled else "disabled_unknown_environment", key
 
 def usage():
     r = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -282,7 +318,13 @@ def report(data, out):
                 lines.append(f"| {category}: {name} | {seconds:.2f} |")
         if timings.get("profiling") is not None:
             lines.append(f"| profiling | {timings['profiling']:.2f} |")
-        lines.append(f"Native build cache hit: {timings.get('build_cache_hit') or 'not reported'}")
+        lines.append(f"Compilation cache hit: {timings.get('build_cache_hit') or 'not reported'}")
+    if data.get("cache"):
+        lines += ["","## Content-addressed cache",""]
+        for side,entry in data["cache"]["binaries"].items():
+            lines.append(f"- {side} executable: {entry['status']}")
+        hits=sum(v=="hit" for v in data["cache"]["fixtures"].values())
+        lines.append(f"- Immutable fixture hits: {hits}/{len(data['cache']['fixtures'])}. Runtime profiles and observations are never reused.")
     probes=data.get("profiling",{}).get("probes",[])
     if probes:
         lines += ["","## Candidate-only diagnostic profiling","","Separate macOS sample run after all timed rounds; collapsed top-of-stack counts include blocked threads and are not CPU percentages. Raw sample and probe logs are in the artifact.","","| Probe | Status | Operations | Top-stack counts |","|---|---|---:|---|"]
@@ -327,6 +369,16 @@ def main():
             bins={}
             shared_target=Path(os.environ["PERF_BUILD_TARGET"]).resolve() if os.getenv("PERF_BUILD_TARGET") else tmp/"shared-target"
             data["execution_timing_seconds"]["build_cache_hit"]=os.getenv("PERF_BUILD_CACHE_HIT")
+            store=Path(os.environ["PERF_CONTENT_CACHE"]).resolve() if os.getenv("PERF_CONTENT_CACHE") else tmp/"content-cache"
+            identity=build_identity(data["environment"],native)
+            fixtures={}
+            data["cache"]={"binaries":{},"fixtures":{},"fixture_sha256":{}}
+            for name in cache.FIXTURE_NAMES:
+                raw=FIXTURE if name=="fixture.html" else (ROOT/"benchmarks"/name).read_bytes()
+                path,hit=cache.fixture(store,name,raw)
+                fixtures[name]=path
+                data["cache"]["fixtures"][name]="hit" if hit else "miss"
+                data["cache"]["fixture_sha256"][name]=digest(path)
             pr_base=resolve_pr_base(head, data["context"])
             data["incremental_reference_sha"]=pr_base
             distinct_base=pr_base is not None and pr_base != BASELINE
@@ -343,14 +395,31 @@ def main():
                 lock=prepare_lock(tree, previous)
                 data["lock_sha256"][side]=digest(lock)
                 shutil.copyfile(lock,out/(side+".Cargo.lock"))
-                bins[side]=build(tree,native,shared_target,tmp/"binaries"/side)
+                bins[side],cache_status,cache_key=build_cached(tree,revision,native,shared_target,tmp/"binaries"/side,store,fixtures,identity,lock)
+                data["cache"]["binaries"][side]={"status":cache_status,"key":cache_key}
+                print(f"CI_BINARY_CACHE {side} {cache_status}",flush=True)
                 data["binary_sha256"][side]={name:digest(binary) for name,binary in bins[side].items()}
                 elapsed=time.monotonic()-build_started
                 data["execution_timing_seconds"]["prepare_and_build"][side]=elapsed
                 print(f"CI_BUILD_TIMING {side} {elapsed:.3f}s",flush=True)
             if pr_base == BASELINE:
                 data["lock_sha256"]["pr_base"]=data["lock_sha256"]["baseline"]
+            cache.prune(store)
+            # Stop compiler-cache activity before measurements and retain actual stats.
+            if os.environ.get("RUSTC_WRAPPER") == "sccache":
+                try:
+                    stats = subprocess.run(["sccache", "--show-stats", "--stats-format", "json"],
+                                           capture_output=True, text=True, check=True, timeout=30)
+                    (out/"compiler-cache-stats.json").write_text(stats.stdout)
+                except (OSError, subprocess.SubprocessError):
+                    print("::warning::Compiler-cache stats unavailable.", flush=True)
+                finally:
+                    try:
+                        subprocess.run(["sccache", "--stop-server"], check=False, timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        print("::warning::Could not stop compiler cache server.", flush=True)
             server=http.server.ThreadingHTTPServer(("127.0.0.1",0),Fixture)
+            server.fixture=fixtures["fixture.html"].read_bytes()
             thread=threading.Thread(target=server.serve_forever,daemon=True)
             thread.start()
             url=f"http://127.0.0.1:{server.server_port}/"
