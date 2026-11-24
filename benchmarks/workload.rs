@@ -56,6 +56,20 @@ fn chrome() {
             sample("chrome_query", query);
             sample("chrome_eval_roundtrip", || assert_eq!(pane.eval("document.title").unwrap(), "Herdr performance fixture"));
         }
+        // Real CDP payloads, bypassing the agent output cap only inside this
+        // trusted fixture. Both revisions execute identical calls. Verify the
+        // entire returned payload outside the timed interval.
+        for (name, count) in [("chrome_eval_64kib", 65_536usize), ("chrome_eval_1mib", 1_048_576usize)] {
+            let expected = "x".repeat(count);
+            let expression = format!("'x'.repeat({count})");
+            for _ in 0..3 {
+                assert_eq!(pane.eval(&expression).unwrap().as_str(), Some(expected.as_str()));
+            }
+            for _ in 0..10 {
+                let value = sample(name, || pane.eval(&expression).unwrap());
+                assert_eq!(value.as_str(), Some(expected.as_str()));
+            }
+        }
         let pos: Value = pane.eval("(()=>{let r=document.querySelector('#action').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()").unwrap();
         for i in 1..=5 {
             sample("chrome_click_to_dom_observed", || {

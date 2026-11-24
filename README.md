@@ -19,3 +19,7 @@ The initial source migration targets the existing `feature/native-browser-tabs` 
 ## Automated upstream compatibility
 
 The scheduled `adapter-upstream-compat` workflow checks the official stable upstream tag every Monday. Changes create a pinned, auditable PR; missing host API anchors or a `gpui-pre` mismatch **fail Adapter CI closed**. No arbitrary upstream code is executed. The scan is a preflight, never a replacement for Host dual-browser and native-approval E2E. The workflow explicitly dispatches CI for GITHUB_TOKEN-created PRs.
+
+## Development
+
+See [AGENTS.md](AGENTS.md) for responsibility-based code navigation and [performance methodology](docs/PERFORMANCE.md) for the immutable baseline, paired CI workloads and interpretation limits.
