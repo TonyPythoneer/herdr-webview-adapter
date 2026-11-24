@@ -35,9 +35,10 @@ def gpui(text):
     return m.group(1) if m else None
 
 
-def probe(source, adapter, tag, sha):
-    if not STABLE.fullmatch(tag) or not re.fullmatch("[0-9a-f]{40}", sha):
-        raise ValueError("invalid pinned upstream identity")
+def probe(source, adapter, tag, sha, tag_object_sha):
+    if (not STABLE.fullmatch(tag) or not re.fullmatch("[0-9a-f]{40}", sha)
+            or not re.fullmatch("[0-9a-f]{40}", tag_object_sha)):
+        raise ValueError("invalid pinned upstream commit/tag object identity")
     missing, upstream_cargo = [], ""
     for name, anchors in ANCHORS.items():
         path = source / name
@@ -49,7 +50,8 @@ def probe(source, adapter, tag, sha):
             upstream_cargo = text
         missing.extend(name + ": " + anchor for anchor in anchors if anchor not in text)
     adapter_gpui, upstream_gpui = gpui(adapter.read_text()), gpui(upstream_cargo)
-    return {"schema": 1, "repository": "herdrdev/herdr-app", "tag": tag, "sha": sha,
+    return {"schema": 2, "repository": "herdrdev/herdr-app", "tag": tag, "sha": sha,
+            "tag_object_sha": tag_object_sha,
             "adapter_gpui": adapter_gpui, "upstream_gpui": upstream_gpui,
             "missing_anchors": missing,
             "compatible": not missing and adapter_gpui is not None and adapter_gpui == upstream_gpui,
@@ -57,9 +59,12 @@ def probe(source, adapter, tag, sha):
 
 
 def gate(report, manifest):
-    return (report.get("repository") == "herdrdev/herdr-app" and
+    return (report.get("schema") == 2 and
+            report.get("repository") == "herdrdev/herdr-app" and
             isinstance(report.get("tag"), str) and STABLE.fullmatch(report["tag"]) is not None and
             isinstance(report.get("sha"), str) and re.fullmatch("[0-9a-f]{40}", report["sha"]) is not None and
+            isinstance(report.get("tag_object_sha"), str) and
+            re.fullmatch("[0-9a-f]{40}", report["tag_object_sha"]) is not None and
             report.get("compatible") is True and not report.get("missing_anchors") and
             gpui(manifest) is not None and report.get("adapter_gpui") == gpui(manifest) and
             report.get("upstream_gpui") == gpui(manifest))
@@ -73,13 +78,15 @@ def main():
     scan.add_argument("--source", type=Path, required=True)
     scan.add_argument("--tag", required=True)
     scan.add_argument("--sha", required=True)
+    scan.add_argument("--tag-object-sha", required=True)
     verify = sub.add_parser("gate")
     verify.add_argument("record", type=Path)
     args = p.parse_args()
     if args.action == "select":
         print(*select_tag(sys.stdin.read()))
     elif args.action == "probe":
-        print(json.dumps(probe(args.source, Path("Cargo.toml"), args.tag, args.sha), indent=2))
+        print(json.dumps(probe(args.source, Path("Cargo.toml"), args.tag, args.sha,
+                               args.tag_object_sha), indent=2))
     else:
         report = json.loads(args.record.read_text())
         if not gate(report, Path("Cargo.toml").read_text()):

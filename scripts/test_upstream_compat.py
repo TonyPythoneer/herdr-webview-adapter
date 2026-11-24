@@ -25,15 +25,34 @@ class UpstreamTests(unittest.TestCase):
                     if name == "Cargo.toml" else ""))
             adapter = root / "adapter.toml"
             adapter.write_text('gpui = { package = "gpui-pre", version = "=0.3.8" }\n')
-            good = probe(root, adapter, "v0.1.16", "a" * 40)
+            good = probe(root, adapter, "v0.1.16", "a" * 40, "a" * 40)
             self.assertTrue(gate(good, adapter.read_text()))
             (root / "src/commands.rs").write_text("pub const COMMANDS")
-            bad = probe(root, adapter, "v0.1.17", "b" * 40)
+            bad = probe(root, adapter, "v0.1.17", "b" * 40, "b" * 40)
             self.assertFalse(gate(bad, adapter.read_text()))
             (root / "Cargo.toml").write_text('gpui = { package = "gpui-pre", version = "=0.3.9" }\n')
-            self.assertFalse(probe(root, adapter, "v0.1.17", "b" * 40)["compatible"])
+            self.assertFalse(probe(root, adapter, "v0.1.17", "b" * 40, "b" * 40)["compatible"])
             good["adapter_gpui"] = "4.0"
             self.assertFalse(gate(good, adapter.read_text()))
+            good["adapter_gpui"] = "0.3.8"
+            good["tag_object_sha"] = "invalid"
+            self.assertFalse(gate(good, adapter.read_text()))
+
+    def test_annotated_tags_keep_object_and_commit_identities_separate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, anchors in ANCHORS.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(anchors) + (
+                    '\ngpui = { package = "gpui-pre", version = "=0.3.8" }'
+                    if name == "Cargo.toml" else ""))
+            manifest = root / "adapter.toml"
+            manifest.write_text('gpui = { package = "gpui-pre", version = "=0.3.8" }')
+            report = probe(root, manifest, "v0.1.17", "a" * 40, "b" * 40)
+            self.assertEqual(report["sha"], "a" * 40)
+            self.assertEqual(report["tag_object_sha"], "b" * 40)
+            self.assertTrue(gate(report, manifest.read_text()))
 
 
 if __name__ == "__main__":
