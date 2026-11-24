@@ -176,7 +176,7 @@ class PublishingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(pub, "api", side_effect=fake_api), \
              patch.object(pub, "match_pr", return_value=pr), patch.object(pub, "newest_run", return_value=True), \
              patch.object(pub, "paged", side_effect=lambda *a, **kw: iter(comments)), \
-             patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99"}), \
+             patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99", "GITHUB_STEP_SUMMARY": ""}), \
              patch.object(sys, "argv", ["report", "--run-id", "12", "--out", tmp]):
             self.assertEqual(pub.main(), 0)
             self.assertEqual(len(comments), 1)
