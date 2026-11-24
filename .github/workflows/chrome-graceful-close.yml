@@ -38,6 +38,15 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/herdr-perf-target
         run: |
           set -euo pipefail
+          cleanup_profile() {
+            local dir="$1"
+            for attempt in 1 2 3 4 5; do
+              if rm -rf -- "$dir"; then return 0; fi
+              sleep 1
+            done
+            echo "::error::Temporary Chrome profile could not be removed: $dir"
+            return 1
+          }
           mkdir -p probe-report
           git rev-parse HEAD > probe-report/revision.txt
           sw_vers > probe-report/environment.txt
@@ -48,7 +57,7 @@ jobs:
             for j in "$((i%2))" "$((1-i%2))"; do
               D="$(mktemp -d)"
               HERDR_APP_HOME="$D" HERDR_EXPERIMENT_GRACEFUL_CLOSE="$j" "$CARGO_TARGET_DIR/release/examples/graceful_close" | tee -a probe-report/samples.jsonl
-              rm -rf "$D"
+              cleanup_profile "$D"
             done
           done
       - uses: actions/upload-artifact@v4
