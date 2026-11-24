@@ -34,8 +34,16 @@ jobs:
             echo "::error::Previously audited upstream stable tag $tag MOVED ($current_object -> $object_sha). Refusing silent retag."
             exit 1
           fi
-          branch="automation/upstream-compat-${tag}-${object_sha:0:12}"
-          if [[ -n "$(git ls-remote --heads origin "refs/heads/$branch")" ]]; then echo "Proposal already exists: $branch"; exit 0; fi
+          legacy_branch="automation/upstream-compat-${tag}-${object_sha:0:12}"
+          # Old schema-1 branches may have been pushed before PR creation failed.
+          # Do not overwrite them or mistake an orphan branch for an existing PR.
+          branch="${legacy_branch}-schema2"
+          owner="${GH_REPO%%/*}"
+          legacy_open="$(gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f base=main -f head="$owner:$legacy_branch" --jq 'length')"
+          if [[ "$legacy_open" != 0 ]]; then
+            echo "::warning::Legacy upstream proposal is still open; review it before creating a replacement."
+            exit 0
+          fi
           upstream="$RUNNER_TEMP/herdr-upstream"
           mkdir -p "$upstream"
           git -C "$upstream" init -q
@@ -77,16 +85,48 @@ jobs:
               exit 0
             fi
           fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout -b "$branch"
-          git add Cargo.toml .github/upstream-compat.json
-          git commit -m "chore(compat): audit upstream $tag"
-          git push origin "HEAD:refs/heads/$branch"
-          compatible="$(python3 -c 'import json; print(json.load(open(".github/upstream-compat.json"))["compatible"])')"
-          gh pr create -R "$GH_REPO" -B main -H "$branch" \
-            -t "chore(compat): review upstream $tag" \
-            -b "Static upstream compatibility report for herdrdev/herdr-app@$tag ($commit). Anchor and GPUI check: $compatible. Any coordinated GPUI dependency changes were resolved before PR creation. This does not automatically change the Host; packaged-app E2E is still required."
-          # GITHUB_TOKEN PR creation does not trigger pull_request CI.
-          gh workflow run ci.yml -R "$GH_REPO" --ref "$branch"
-          gh workflow run performance.yml -R "$GH_REPO" --ref "$branch"
+          # A branch alone is not proof of a successful proposal.
+          # Recover interrupted runs without force-pushing or duplicating PRs.
+          existing="$(gh api --method GET "repos/$GH_REPO/pulls" -f state=all -f base=main -f head="$owner:$branch")"
+          if jq -e 'any(.[]; .state == "closed") and (any(.[]; .state == "open") | not)' <<< "$existing" >/dev/null; then
+            echo "Proposal previously closed; respecting maintainer decision."
+            exit 0
+          fi
+          remote="$(git ls-remote --heads origin "refs/heads/$branch")"
+          if [[ -z "$remote" ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git checkout -b "$branch"
+            git add Cargo.toml .github/upstream-compat.json
+            git commit -m "chore(compat): audit upstream $tag"
+            git push origin "HEAD:refs/heads/$branch"
+            proposal_sha="$(git rev-parse HEAD)"
+          else
+            proposal_sha="${remote%%$'\t'*}"
+            git fetch --no-tags origin "refs/heads/$branch"
+            [[ "$(git rev-parse FETCH_HEAD)" == "$proposal_sha" ]]
+            if ! git show "$proposal_sha:Cargo.toml" | cmp -s - Cargo.toml ||
+               ! git show "$proposal_sha:.github/upstream-compat.json" | cmp -s - .github/upstream-compat.json; then
+              echo "::error::Existing proposal differs from freshly audited candidate. Review branch $branch; refusing to overwrite it."
+              exit 1
+            fi
+          fi
+          pr_number="$(jq -r '[.[] | select(.state == "open")][0].number // empty' <<< "$existing")"
+          if [[ -z "$pr_number" ]]; then
+            compatible="$(python3 -c 'import json; print(json.load(open(".github/upstream-compat.json"))["compatible"])')"
+            gh pr create -R "$GH_REPO" -B main -H "$branch" \
+              -t "chore(compat): review upstream $tag" \
+              -b "Static upstream compatibility report for herdrdev/herdr-app@$tag ($commit). Anchor and GPUI check: $compatible. Any coordinated GPUI dependency changes were resolved before PR creation. This does not automatically change the Host; packaged-app E2E is still required."
+          else
+            echo "Existing open proposal #$pr_number"
+          fi
+          # Resume missing CI dispatches after partial failures. Never duplicate
+          # a run already created for the exact proposal commit.
+          for workflow in ci.yml performance.yml; do
+            count="$(gh api --method GET "repos/$GH_REPO/actions/workflows/$workflow/runs" -f head_sha="$proposal_sha" -f per_page=1 --jq '.total_count')"
+            if [[ "$count" == 0 ]]; then
+              gh workflow run "$workflow" -R "$GH_REPO" --ref "$branch"
+            else
+              echo "$workflow already triggered for $proposal_sha"
+            fi
+          done
