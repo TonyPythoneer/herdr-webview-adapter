@@ -37,6 +37,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
+      - name: Identify native runner image
+        if: matrix.suite == 'native'
+        id: native-image
+        shell: bash
+        run: printf 'image=%s-%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Restore native compilation cache
+        if: matrix.suite == 'native'
+        id: native-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            ${{ runner.temp }}/herdr-perf-target
+          key: herdr-native-release-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-image.outputs.image }}-rust1.95.0-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
       - name: Verify Chrome on native runner
         if: matrix.suite == 'native'
         run: |
@@ -48,6 +63,8 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_performance*.py' -v
       - name: Compare fixed baseline and exact PR base with candidate
         env:
+          PERF_BUILD_TARGET: ${{ runner.temp }}/herdr-perf-target
+          PERF_BUILD_CACHE_HIT: ${{ steps.native-cache.outputs.cache-hit }}
           PERF_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PERF_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 scripts/performance.py --suite "${{ matrix.suite }}" --out performance-report

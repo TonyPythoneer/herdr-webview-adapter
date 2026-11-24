@@ -44,7 +44,7 @@ def run(*args, cwd=ROOT):
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def build(tree, native, target):
+def build(tree, native, target, destination):
     examples = tree / "examples"
     examples.mkdir(exist_ok=True)
     shutil.copyfile(ROOT / "benchmarks/workload.rs", examples / "perf_fixed.rs")
@@ -54,11 +54,28 @@ def build(tree, native, target):
             name = "perf_" + case
             shutil.copyfile(ROOT / "benchmarks" / (case + ".rs"), examples / (name + ".rs"))
             names.append(name)
+    # Cargo already parallelizes compilation across independent crates. Reuse
+    # its dependency artifacts instead of compiling three copies simultaneously.
+    # Force a rebuild of the measured package even with a warm/shared target.
+    if target.exists():
+        subprocess.run(["cargo", "clean", "--release", "--locked", "--target-dir", str(target),
+                        "-p", "herdr-webview-adapter"], cwd=tree, check=True, timeout=300)
     args = ["cargo", "build", "--release", "--locked", "--target-dir", str(target)]
     for name in names:
         args += ["--example", name]
     subprocess.run(args, cwd=tree, check=True, timeout=2400)
-    return {n: target / "release/examples" / n for n in names}
+    # Subsequent revisions overwrite the shared example names. Snapshot each
+    # executable to its own directory before another Cargo invocation.
+    destination.mkdir(parents=True, exist_ok=False)
+    binaries = {}
+    for name in names:
+        source = target / "release/examples" / name
+        snapshot = destination / name
+        shutil.copy2(source, snapshot)
+        if digest(source) != digest(snapshot) or not os.access(snapshot, os.X_OK):
+            raise RuntimeError("benchmark executable snapshot failed verification")
+        binaries[name] = snapshot
+    return binaries
 
 def usage():
     r = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -256,6 +273,16 @@ def report(data, out):
             for r in rows:
                 delta="N/A" if r["paired_delta_pct"] is None else f"{r['paired_delta_pct']:+.1f}%"
                 lines.append(f"| {r['metric']} | {r['baseline']['p50']:.4g} | {r['candidate']['p50']:.4g} | {delta} | {r['classification']} |")
+    timings=data.get("execution_timing_seconds",{})
+    if timings:
+        lines += ["","## CI execution timing (not benchmark metrics)","",
+                  "| Stage | Seconds |","|---|---:|"]
+        for category in ("prepare_and_build","measurement"):
+            for name,seconds in timings.get(category,{}).items():
+                lines.append(f"| {category}: {name} | {seconds:.2f} |")
+        if timings.get("profiling") is not None:
+            lines.append(f"| profiling | {timings['profiling']:.2f} |")
+        lines.append(f"Native build cache hit: {timings.get('build_cache_hit') or 'not reported'}")
     probes=data.get("profiling",{}).get("probes",[])
     if probes:
         lines += ["","## Candidate-only diagnostic profiling","","Separate macOS sample run after all timed rounds; collapsed top-of-stack counts include blocked threads and are not CPU percentages. Raw sample and probe logs are in the artifact.","","| Probe | Status | Operations | Top-stack counts |","|---|---|---:|---|"]
@@ -286,7 +313,7 @@ def main():
     data={"schema":2,"baseline_sha":BASELINE,"candidate_sha":head,"incremental_reference_sha":None,"status":"failed","comparison":{},"incremental_comparison":{},"rounds":{},"round_order":{},"errors":[],"profiling":{"schema":1,"method":"macos_sample_adapter_top_of_stack","scope":"candidate_only_diagnostic","probes":[]},
           "context":{"run_id":os.getenv("GITHUB_RUN_ID"),"run_attempt":os.getenv("GITHUB_RUN_ATTEMPT"),"event":os.getenv("GITHUB_EVENT_NAME"),"suite":args.suite,"pr_head_sha":os.getenv("PERF_PR_HEAD_SHA"),"pr_base_sha":os.getenv("PERF_PR_BASE_SHA")},
           "environment":{"platform":platform.platform(),"machine":platform.machine(),"cpu_count":os.cpu_count(),"runner_image":os.getenv("ImageVersion"),"runner_os":os.getenv("RUNNER_OS"),"rust":run("rustc","-Vv"),"cargo":run("cargo","-V")},
-          "workload_sha256":{p.name:digest(p) for p in (ROOT/"benchmarks").glob("*.rs")},"lock_sha256":{}}
+          "workload_sha256":{p.name:digest(p) for p in (ROOT/"benchmarks").glob("*.rs")},"lock_sha256":{},"binary_sha256":{},"execution_timing_seconds":{"prepare_and_build":{},"measurement":{},"profiling":None}}
     if native:
         data["environment"]["hardware"]=run("sysctl","-n","hw.model")
         data["environment"]["macos"]=run("sw_vers")
@@ -298,6 +325,8 @@ def main():
         server=None
         try:
             bins={}
+            shared_target=Path(os.environ["PERF_BUILD_TARGET"]).resolve() if os.getenv("PERF_BUILD_TARGET") else tmp/"shared-target"
+            data["execution_timing_seconds"]["build_cache_hit"]=os.getenv("PERF_BUILD_CACHE_HIT")
             pr_base=resolve_pr_base(head, data["context"])
             data["incremental_reference_sha"]=pr_base
             distinct_base=pr_base is not None and pr_base != BASELINE
@@ -306,6 +335,7 @@ def main():
                 revisions.append(("pr_base",pr_base))
             revisions.append(("candidate",head))
             for side, revision in revisions:
+                build_started=time.monotonic()
                 tree=tmp/side
                 subprocess.run(["git","worktree","add","--detach",str(tree),revision],cwd=ROOT,check=True)
                 previous=list(reversed(list(trees.values())))
@@ -313,7 +343,11 @@ def main():
                 lock=prepare_lock(tree, previous)
                 data["lock_sha256"][side]=digest(lock)
                 shutil.copyfile(lock,out/(side+".Cargo.lock"))
-                bins[side]=build(tree,native,tmp/(side+"-target"))
+                bins[side]=build(tree,native,shared_target,tmp/"binaries"/side)
+                data["binary_sha256"][side]={name:digest(binary) for name,binary in bins[side].items()}
+                elapsed=time.monotonic()-build_started
+                data["execution_timing_seconds"]["prepare_and_build"][side]=elapsed
+                print(f"CI_BUILD_TIMING {side} {elapsed:.3f}s",flush=True)
             if pr_base == BASELINE:
                 data["lock_sha256"]["pr_base"]=data["lock_sha256"]["baseline"]
             server=http.server.ThreadingHTTPServer(("127.0.0.1",0),Fixture)
@@ -322,6 +356,7 @@ def main():
             url=f"http://127.0.0.1:{server.server_port}/"
             suites=["chrome","wk_native_pixels","wk_native_input"] if native else ["portable"]
             for suite in suites:
+                measurement_started=time.monotonic()
                 rounds=data["rounds"][suite]=[]
                 orders=data["round_order"][suite]=[]
                 for i in range(PAIRS):
@@ -341,15 +376,21 @@ def main():
                 data["comparison"][suite]=compare(comparison_pairs(rounds,"baseline"),suite)
                 if pr_base:
                     data["incremental_comparison"][suite]=compare(comparison_pairs(rounds,"pr_base"),suite)
+                elapsed=time.monotonic()-measurement_started
+                data["execution_timing_seconds"]["measurement"][suite]=elapsed
+                print(f"CI_MEASUREMENT_TIMING {suite} {elapsed:.3f}s",flush=True)
             data["status"]="measured"
             # Only after every timed measurement and native proof succeeds.
             # Profiling is diagnostic, never part of the comparison or correctness gate.
             if native:
+                profiling_started=time.monotonic()
                 try:
                     data["profiling"]=profiler.diagnose(bins["candidate"]["perf_fixed"],data["rounds"]["chrome"],data["incremental_comparison"].get("chrome",data["comparison"]["chrome"]),tmp,url,out)
                 except Exception:
                     traceback.print_exc()
                     data["profiling"]["diagnostic_error"]=True
+                finally:
+                    data["execution_timing_seconds"]["profiling"]=time.monotonic()-profiling_started
         except Exception as exc:
             data["errors"].append(str(exc))
             traceback.print_exc()

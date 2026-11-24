@@ -122,3 +122,30 @@ not automatically optimizing JSON; substantial serialization leaf stacks
 warrant a focused parser/transport experiment. Measure the proposed change
 against the exact PR base; never equate a sampling category with a proven
 root cause. Do not add more probes unless they close a specific evidence gap.
+
+## CI runtime optimization
+
+The Ubuntu and macOS correctness jobs and the portable/native performance jobs
+already run independently. Cargo compiles independent crates in parallel and
+Rust's libtest uses its normal parallel test runner. The expensive part of the
+native performance job was three separate dependency builds, not the timed
+workloads (PR #10 run 45349169737: roughly 12 minutes preparing/building and
+2.4 minutes measuring). The native correctness job likewise spent roughly
+8 minutes preparing/building before its unit tests.
+
+Reuse a single Cargo release target directory for all measured revisions,
+but explicitly clean the measured package before each build and copy every
+release executable into its own verified, executable snapshot before the next
+build. Cargo still validates dependency fingerprints and each revision's lock.
+Record the binary SHA-256s, preparation/build durations, measurement durations,
+and optional profiling duration in the raw artifact. Never reuse measurements.
+Native correctness and performance jobs use independent compilation caches,
+keyed by OS, architecture, runner image, Rust toolchain and manifest/lock hash.
+A cache miss is valid; the first run may populate a cache rather than speed up.
+Compare cold and warm timings before claiming an improvement.
+
+Do not parallelize benchmark rounds on the same runner: CPU, memory and browser
+contention would invalidate comparisons. Native UI tests also retain their
+existing isolation. If measurement time later dominates, split independent
+workloads across isolated runners, keeping each workload's three revisions on
+the same machine. No correctness or native proof gate is removed.

@@ -1,4 +1,5 @@
 import unittest
+import os
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -72,6 +73,32 @@ class IncrementalHarnessTests(unittest.TestCase):
             with patch.object(p.subprocess, "run", side_effect=generate) as run:
                 self.assertEqual(p.prepare_lock(candidate, [prior, base]).read_text(), "new lock")
                 run.assert_called_once()
+
+class BuildReuseTests(unittest.TestCase):
+    def test_shared_target_rebuild_and_revision_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            baseline, candidate = root / "baseline", root / "candidate"
+            baseline.mkdir()
+            candidate.mkdir()
+            calls = []
+            def cargo(args, **kwargs):
+                calls.append((args, kwargs["cwd"]))
+                if args[1] == "build":
+                    output = target / "release" / "examples" / "perf_fixed"
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    output.write_bytes(kwargs["cwd"].name.encode())
+                    output.chmod(0o755)
+            with patch.object(p.subprocess, "run", side_effect=cargo):
+                first = p.build(baseline, False, target, root / "binaries" / "baseline")
+                second = p.build(candidate, False, target, root / "binaries" / "candidate")
+            self.assertEqual(first["perf_fixed"].read_bytes(), b"baseline")
+            self.assertEqual(second["perf_fixed"].read_bytes(), b"candidate")
+            self.assertNotEqual(p.digest(first["perf_fixed"]), p.digest(second["perf_fixed"]))
+            self.assertEqual([args[1] for args, _ in calls], ["build", "clean", "build"])
+            self.assertIn("herdr-webview-adapter", calls[1][0])
+            self.assertTrue(os.access(second["perf_fixed"], os.X_OK))
 
 class NativeProofTests(unittest.TestCase):
     def test_pixel_missing_final_proof_fails(self):
