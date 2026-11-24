@@ -17,7 +17,7 @@ gpui = { package = "gpui-pre", version = "=0.3.8" }
 gpui-wry = "=0.7.2"
 wry = { package = "lb-wry", version = "=0.53.3" }
 raw-window-handle = "0.6"
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp"] }
 smallvec = "1"
 libc = "0.2"
