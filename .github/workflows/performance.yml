@@ -1,0 +1,58 @@
+name: adapter-performance
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adapter-performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: performance-${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: portable
+            runner: ubuntu-latest
+          - suite: native
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # For PRs, test GitHub's merge commit (including latest base files).
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - name: Verify Chrome on native runner
+        if: matrix.suite == 'native'
+        run: |
+          CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          test -x "$CHROME"
+          "$CHROME" --version
+          echo "HERDR_CHROME_BINARY=$CHROME" >> "$GITHUB_ENV"
+      - name: Test report calculations
+        run: python3 -m unittest discover -s scripts -p test_performance.py -v
+      - name: Compare immutable baseline with candidate
+        run: python3 scripts/performance.py --suite "${{ matrix.suite }}" --out performance-report
+      - name: Upload observations and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adapter-performance-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: performance-report/
+          if-no-files-found: error
+          retention-days: 90

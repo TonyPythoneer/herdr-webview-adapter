@@ -2,7 +2,7 @@ name: dependabot-automerge
 
 on:
   workflow_run:
-    workflows: [adapter-ci]
+    workflows: [adapter-ci, adapter-performance]
     types: [completed]
   workflow_dispatch:
   schedule:
@@ -60,6 +60,18 @@ jobs:
               echo "PR #$number: expected CI jobs not all successful"
               continue
             fi
+            perf_runs="$(gh api "repos/$GH_REPO/actions/workflows/performance.yml/runs?event=pull_request&head_sha=$sha&per_page=100")"
+            perf_run="$(jq -c --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha and .event == "pull_request")] | sort_by(.created_at, .id) | last // {}' <<< "$perf_runs")"
+            if ! jq -e '.status == "completed" and .conclusion == "success"' <<< "$perf_run" >/dev/null; then
+              echo "PR #$number: performance CI not successful for $sha"
+              continue
+            fi
+            perf_id="$(jq -r '.id' <<< "$perf_run")"
+            perf_jobs="$(gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$perf_id/jobs?filter=latest&per_page=100")"
+            if ! jq -e '[.[].jobs[]] | length > 0 and any(.[]; .name == "performance-portable" and .conclusion == "success") and any(.[]; .name == "performance-native" and .conclusion == "success") and all(.[]; .status == "completed" and .conclusion == "success")' <<< "$perf_jobs" >/dev/null; then
+              echo "PR #$number: expected performance jobs not all successful"
+              continue
+            fi
             rollup="$(gh pr view "$number" --json headRefOid,statusCheckRollup)"
             if ! jq -e --arg sha "$sha" '.headRefOid == $sha and (.statusCheckRollup | length > 0 and all(.[]; (.status == "COMPLETED" and .conclusion == "SUCCESS") or .state == "SUCCESS"))' <<< "$rollup" >/dev/null; then
               echo "PR #$number: another check is pending or unsuccessful"
@@ -80,4 +92,5 @@ jobs:
             echo "Merged Dependabot PR #$number ($sha)"
             # Token-generated pushes do not trigger normal push CI.
             gh workflow run ci.yml --ref main
+            gh workflow run performance.yml --ref main
           done
