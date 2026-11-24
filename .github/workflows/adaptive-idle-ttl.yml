@@ -1,0 +1,38 @@
+name: adapter-adaptive-idle-ttl
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/adaptive_idle_ttl.py'
+      - 'scripts/test_adaptive_idle_ttl.py'
+      - '.github/workflows/adaptive-idle-ttl.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: adaptive-idle-ttl-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  experiment:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Run independent experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe-report
+          git rev-parse HEAD > probe-report/revision.txt
+          sw_vers > probe-report/environment.txt
+          python3 -m unittest discover -s scripts -p test_adaptive_idle_ttl.py -v
+          python3 scripts/adaptive_idle_ttl.py --out probe-report/ttl-replay.json | tee probe-report/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: adaptive-idle-ttl-${{ github.run_attempt }}
+          path: probe-report/
+          if-no-files-found: warn
+          retention-days: 30
