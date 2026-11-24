@@ -1,0 +1,49 @@
+name: adapter-benchmark-feedback
+
+on:
+  workflow_run:
+    workflows: [adapter-performance]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Completed adapter-performance run ID (for replay)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+concurrency:
+  group: benchmark-feedback-${{ github.event.workflow_run.head_branch || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    # Manual dispatch may only execute trusted main; workflow_run already
+    # runs the default branch workflow. Never checkout a candidate revision.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test trusted report parser
+        run: python3 -m unittest discover -s scripts -p 'test_performance_feedback.py' -v
+      - name: Generate feedback and publish PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: python3 scripts/publish_performance_feedback.py --run-id "$SOURCE_RUN_ID" --out benchmark-feedback
+      - name: Archive AI-readable evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-feedback
+          path: benchmark-feedback/
+          if-no-files-found: warn
+          retention-days: 90
