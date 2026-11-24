@@ -220,7 +220,7 @@ impl Client {
         Ok(client)
     }
 
-    pub fn request(&self, method: &str, params: Value, session: Option<&str>) -> Result<Value, String> {
+    fn begin_request(&self, method: &str, params: Value, session: Option<&str>) -> Result<(u64, Receiver<Result<Value, String>>), String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -228,13 +228,43 @@ impl Client {
             self.pending.lock().unwrap().remove(&id);
             return Err(e);
         }
-        match rx.recv_timeout(CDP_TIMEOUT) {
+        Ok((id, rx))
+    }
+
+    fn finish_request(&self, method: &str, id: u64, rx: Receiver<Result<Value, String>>, timeout: Duration) -> Result<Value, String> {
+        match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
                 Err(format!("CDP_TIMEOUT: {method} did not answer"))
             }
         }
+    }
+
+    pub fn request(&self, method: &str, params: Value, session: Option<&str>) -> Result<Value, String> {
+        let (id, rx) = self.begin_request(method, params, session)?;
+        self.finish_request(method, id, rx, CDP_TIMEOUT)
+    }
+
+    // Enable both independent domains before waiting; preserve the barrier
+    // before debugger resume, resize, navigation and capture.
+    fn enable_session_domains(&self, session: &str) -> Result<(), String> {
+        let (page_id, page_rx) = self.begin_request("Page.enable", json!({}), Some(session))?;
+        let (runtime_id, runtime_rx) = match self.begin_request("Runtime.enable", json!({}), Some(session)) {
+            Ok(request) => request,
+            Err(error) => {
+                self.pending.lock().unwrap().remove(&page_id);
+                return Err(error);
+            }
+        };
+        let deadline = Instant::now() + CDP_TIMEOUT;
+        if let Err(error) = self.finish_request("Page.enable", page_id, page_rx, CDP_TIMEOUT) {
+            self.pending.lock().unwrap().remove(&runtime_id);
+            return Err(error);
+        }
+        self.finish_request("Runtime.enable", runtime_id, runtime_rx,
+            deadline.saturating_duration_since(Instant::now()))?;
+        Ok(())
     }
 
     fn write_message(&self, id: u64, method: &str, params: Value, session: Option<&str>) -> Result<(), String> {
@@ -313,8 +343,7 @@ impl Client {
             document_ready: ready_tx,
         });
         let pane = Session { client: self.clone(), target, session, frames: Mutex::new(rx) };
-        pane.command("Page.enable", json!({}))?;
-        pane.command("Runtime.enable", json!({}))?;
+        self.enable_session_domains(&pane.session)?;
         // Chrome 144+ may leave a newly attached target waiting for the
         // debugger even after domain enable succeeds. A suspended target can
         // respond to enable/evaluate but never navigate or fetch page content.
@@ -585,12 +614,22 @@ mod tests {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
-                        let n = connection.read(&mut request).unwrap_or(0);
+                        // TCP may split a request line between reads. Read the
+                        // bounded complete headers, not a single arbitrary chunk.
+                        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut n = 0;
+                        while n < request.len() && !request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            match connection.read(&mut request[n..]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => n += count,
+                            }
+                        }
+                        if !request[..n].windows(4).any(|w| w == b"\r\n\r\n") { continue }
                         // A parser-blocking script keeps readyState at "loading" while
                         // the actual target exists, exercising readiness wakeups.
                         if request[..n].starts_with(b"GET /delayed.js ") {
                             std::thread::sleep(Duration::from_millis(250));
-                            let body = "document.title = 'Herdr delayed fixture';";
+                            let body = "window.__herdrDelayedScriptRan = true; document.title = 'Herdr delayed fixture';";
                             let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                             continue;
                         }
@@ -708,11 +747,23 @@ mod tests {
             .expect_err("cancellation gate") .starts_with("CANCELLED"));
 
         drop(pane);
+        assert!(client.enable_session_domains("invalid-session-id").is_err());
+        assert!(client.pending.lock().unwrap().is_empty(), "failed enables must not leak pending requests");
         let delayed = client.open(&format!("http://{address}/delayed"))
             .expect("delayed document must become interactive before screencast");
-        let state = delayed.eval("({title:document.title,ready:document.readyState})").unwrap();
+        let state = delayed.eval("({href:location.href,ready:document.readyState})").unwrap();
+        assert_eq!(state["href"], format!("http://{address}/delayed"));
         assert!(matches!(state["ready"].as_str(), Some("interactive" | "complete")));
-        assert_eq!(state["title"], "Herdr delayed fixture");
+        // The public open contract is an interactive document, not a particular
+        // application title. Independently require that the real delayed script
+        // executes; a missing or misrouted response still fails the test.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = delayed.eval("({title:document.title,ran:window.__herdrDelayedScriptRan===true})").unwrap();
+            if state["ran"] == true && state["title"] == "Herdr delayed fixture" { break }
+            assert!(Instant::now() < deadline, "delayed script did not execute: {state}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(delayed.frame_timeout(Duration::from_secs(10)).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
         drop(delayed);
         drop(client);
