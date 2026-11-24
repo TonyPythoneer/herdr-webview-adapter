@@ -244,3 +244,24 @@ claim until five paired rounds and correctness gates are reviewed.
 Main native correctness run 45370228775 failed the delayed-title assertion;
 the fixture now reads complete bounded HTTP headers and verifies script
 execution separately from the interactive-document contract.
+
+
+## Phase 8 — Retest the screenshot encoder trade-off after PR #16
+
+PR #16 incremental evidence (run 45376354155, feedback 45378912726):
+session open -24.0%, screenshot +14.8%, confirmed session close +12.6%,
+eval roundtrip +8.1%; all inconclusive under the five-pair screen. The
+PR-base and candidate native lock hashes match. Session open improved in
+four of five pairs; none of the 23 metrics had a paired median >= +15%.
+PR #16 was accepted as an incremental simplification, not a claim of a
+confirmed speedup. Screenshot latency is the largest positive paired
+median, but its causal relationship with the Runtime subscription change
+is unproven. PR #13's fast encoder also had no confirmed incremental
+benefit. Test removing that optional encoder and its viewport-lock
+machinery on the new exact main base; keep lossless PNG, limits, private
+profile, readiness and all native correctness repairs including actual
+pixel and resized dimensions checks. Retain the fixed workload. Review
+screenshot, session open/close, first frame, query/eval and whole-workload
+results before merging; no claimed gain before measurement. Remaining
+session-close and eval trends need separate evidence; PR #17 already
+targets transport. Do not infer host paint time from CDP receipt.
