@@ -211,3 +211,36 @@ already be ready at the first check; an inconclusive result must not be reported
 as an improvement. Native correctness includes a delayed-document fixture.
 Use the same five paired rounds and existing screening threshold; retain only
 if supported by evidence and host E2E. No claim of UI presentation speed.
+
+
+## Phase 7 — Bounded fast PNG screenshot experiment
+
+Latest main exact SHA `e900f64bbbc9fdf0c210eda18ae6843a28dacefa`,
+native run 45370228875, normalized feedback run 45370824491:
+screenshot p50 89.483 ms, 1,380.737 ms median cumulative operation time
+per process; Chrome startup p50 1,052.768 ms, first frame p50 161.408 ms.
+The screenshot diagnostic completed 71 verified operations; 164 wait and
+164 read leaf-stack observations are consistent with waiting on Chrome,
+not proof of encoder CPU cost. Workload hash
+`8d72ba0b1fd474ff43dd03f84a1849acc8b73daef5a9b9896a96d930a7eb70cd`;
+candidate native lock `c7fdd477a6b528f029e3318267facd26ad4482210cc58d4f0d9bf959cf29a809`;
+fixed-baseline native lock differs. Use the direct PR-base comparison and
+check its lock hash before attributing any improvement to code.
+
+Hypothesis: Chromium's documented Page.captureScreenshot optimizeForSpeed
+option reduces encoding latency while preserving decoded PNG pixels.
+Use it only for known <= 1,048,576-pixel viewports configured at scale 1;
+unknown and larger viewports keep the original encoder. Serialize resize
+and screenshot, invalidate known dimensions on raw Emulation commands,
+retain size checks and retry normal encoding if the fast result exceeds
+the existing encoded size cap. Never weaken framing limits. The fast
+encoder can increase compressed bytes; no assertion of lower memory use.
+Compare exact decoded pixels and large-viewport fallback in native tests.
+Official protocol: https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-captureScreenshot
+
+Primary metric chrome_screenshot_png_ms; also inspect CPU, RSS, frame and
+overall workload. Existing benchmark harness unchanged. No improvement
+claim until five paired rounds and correctness gates are reviewed.
+Main native correctness run 45370228775 failed the delayed-title assertion;
+the fixture now reads complete bounded HTTP headers and verifies script
+execution separately from the interactive-document contract.
