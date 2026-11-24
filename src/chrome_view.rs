@@ -246,7 +246,7 @@ impl ChromeView {
     }
 }
 
-fn decode_frame(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
+fn decode_frame_pixels(bytes: &[u8]) -> Result<image::RgbaImage, String> {
     if bytes.len() > 12 * 1024 * 1024 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("invalid or oversized Chrome PNG frame".into());
     }
@@ -255,6 +255,11 @@ fn decode_frame(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
         .into_rgba8();
     // gpui-pre's atlas expects BGRA byte ordering, unlike PNG's RGBA.
     for pixel in image.chunks_exact_mut(4) { pixel.swap(0, 2) }
+    Ok(image)
+}
+
+fn decode_frame(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
+    let image = decode_frame_pixels(bytes)?;
     Ok(Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(image)])))
 }
 
@@ -297,5 +302,25 @@ impl Render for ChromeView {
             .on_scroll_wheel(cx.listener(Self::wheel))
             .on_key_down(cx.listener(Self::key))
             .child(screen)
+    }
+}
+
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    #[test]
+    fn png_conversion_preserves_bgra_pixels() {
+        let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(3, 2, image::Rgba([17, 91, 201, 113])));
+        let rgb = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 2, image::Rgb([17, 91, 201])));
+        for source in [rgba, rgb] {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+            let mut expected = source.to_rgba8();
+            for pixel in expected.chunks_exact_mut(4) { pixel.swap(0, 2) }
+            assert_eq!(decode_frame_pixels(encoded.get_ref()).unwrap(), expected);
+            assert!(decode_frame(encoded.get_ref()).is_ok());
+        }
+        assert!(decode_frame_pixels(b"invalid").is_err());
     }
 }
