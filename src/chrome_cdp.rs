@@ -23,16 +23,6 @@ use std::{
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 const MAX_FRAME_BASE64: usize = 16 * 1024 * 1024;
 const CDP_TIMEOUT: Duration = Duration::from_secs(15);
-// For the speed-oriented PNG encoder, bound the configured physical pixel
-// area well below the existing 12 MiB decoded / 16 MiB encoded payload limit.
-// Even incompressible RGBA at this size is about 4 MiB before PNG overhead.
-const FAST_PNG_MAX_PIXELS: u64 = 1024 * 1024;
-
-fn fast_png_allowed(viewport: Option<(u32, u32)>) -> bool {
-    viewport.is_some_and(|(w,h)| w != 0 && h != 0
-        && u64::from(w) * u64::from(h) <= FAST_PNG_MAX_PIXELS)
-}
-
 #[derive(Clone, Debug)]
 pub struct ChromeBinary {
     pub path: PathBuf,
@@ -321,10 +311,12 @@ impl Client {
             frames: tx,
             document_ready: ready_tx,
         });
-        let pane = Session { client: self.clone(), target, session, frames: Mutex::new(rx),
-            viewport: Mutex::new(None) };
+        let pane = Session { client: self.clone(), target, session, frames: Mutex::new(rx) };
         pane.command("Page.enable", json!({}))?;
-        pane.command("Runtime.enable", json!({}))?;
+        // Runtime.enable only subscribes to execution-context notifications.
+        // This adapter evaluates directly in the default context and never
+        // consumes those notifications. Runtime.evaluate and debugger resume
+        // do not require the subscription. Avoid that extra round trip.
         // Chrome 144+ may leave a newly attached target waiting for the
         // debugger even after domain enable succeeds. A suspended target can
         // respond to enable/evaluate but never navigate or fetch page content.
@@ -428,27 +420,14 @@ pub struct Session {
     pub target: String,
     pub session: String,
     frames: Mutex<Receiver<String>>,
-    // Serialize screenshot/resize, and invalidate the known viewport if a raw
-    // emulation command changes it. Never hold this lock in the CDP reader.
-    viewport: Mutex<Option<(u32, u32)>>,
 }
 
 impl Session {
     pub fn post(&self, name: &str, params: Value) -> Result<(), String> {
-        if name.starts_with("Emulation.") {
-            let mut viewport = self.viewport.lock().unwrap();
-            *viewport = None;
-            return self.client.send(name, params, Some(&self.session));
-        }
         self.client.send(name, params, Some(&self.session))
     }
 
     pub fn command(&self, name: &str, params: Value) -> Result<Value, String> {
-        if name.starts_with("Emulation.") {
-            let mut viewport = self.viewport.lock().unwrap();
-            *viewport = None;
-            return self.client.request(name, params, Some(&self.session));
-        }
         self.client.request(name, params, Some(&self.session))
     }
 
@@ -465,12 +444,9 @@ impl Session {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return Err("Chrome viewport must be 1..8192 CSS pixels per axis".into());
         }
-        let mut viewport = self.viewport.lock().unwrap();
-        *viewport = None;
-        self.client.request("Emulation.setDeviceMetricsOverride", json!({
+        self.command("Emulation.setDeviceMetricsOverride", json!({
             "width":width,"height":height,"deviceScaleFactor":1,"mobile":false,
-        }), Some(&self.session))?;
-        *viewport = Some((width,height));
+        }))?;
         Ok(())
     }
 
@@ -486,22 +462,6 @@ impl Session {
     }
 
     pub fn screenshot(&self) -> Result<Vec<u8>, String> {
-        let viewport = self.viewport.lock().unwrap();
-        // Chromium supports faster lossless PNG encoding at the cost of
-        // compression ratio. Keep the old encoder for unknown/large viewports.
-        // Do not change the capture surface, bounds, format or size limits.
-        if fast_png_allowed(*viewport) {
-            let result = self.command("Page.captureScreenshot", json!({
-                "format":"png","captureBeyondViewport":false,"optimizeForSpeed":true
-            }))?;
-            let encoded = result.get("data").and_then(Value::as_str).ok_or("CDP screenshot data missing")?;
-            if encoded.len() <= MAX_FRAME_BASE64 {
-                return base64::engine::general_purpose::STANDARD.decode(encoded)
-                    .map_err(|e| format!("invalid Chrome screenshot: {e}"));
-            }
-            // A surprising encoded size must not make a previously valid
-            // capture fail solely because the encoder favors speed.
-        }
         let result = self.command("Page.captureScreenshot", json!({"format":"png","captureBeyondViewport":false}))?;
         let encoded = result.get("data").and_then(Value::as_str).ok_or("CDP screenshot data missing")?;
         if encoded.len() > MAX_FRAME_BASE64 {
@@ -573,16 +533,6 @@ pub fn persistent_profile() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fast_png_requires_small_known_viewport() {
-        assert!(fast_png_allowed(Some((1024,768))));
-        assert!(fast_png_allowed(Some((1024,1024))));
-        assert!(!fast_png_allowed(Some((1024,1025))));
-        assert!(!fast_png_allowed(Some((8192,8192))));
-        assert!(!fast_png_allowed(Some((0,1))));
-        assert!(!fast_png_allowed(None));
-    }
 
     #[test]
     fn document_ready_hints_are_bounded_and_only_lifecycle_events() {
@@ -679,6 +629,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(title, "Herdr fixture");
+        // Runtime remains usable without subscribing to context events.
+        assert_eq!(pane.eval("6 * 7").unwrap(), 42);
+        assert_eq!(pane.eval("Promise.resolve(43)").unwrap(), 43);
         let frame = pane.frame_timeout(Duration::from_secs(10)).expect("headless CDP must emit real screencast frames");
         assert!(frame.starts_with(b"\x89PNG\r\n\x1a\n"), "screencast must be PNG");
         let png = pane.screenshot().unwrap();
@@ -786,20 +739,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(delayed.frame_timeout(Duration::from_secs(10)).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
-        // Compare the actual decoded pixels against the original encoder.
+        // Verify the actual decoded pixels, not merely the PNG signature.
         // A static colored document avoids input focus/caret differences.
         delayed.eval("document.body.innerHTML='';document.body.style='margin:0;background:rgb(23,91,177)'").unwrap();
         delayed.eval("new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r(true))))").unwrap();
         let png = delayed.screenshot().unwrap();
-        let original = delayed.command("Page.captureScreenshot", json!({"format":"png","captureBeyondViewport":false})).unwrap();
-        let original = base64::engine::general_purpose::STANDARD.decode(original["data"].as_str().unwrap()).unwrap();
         let decode = |bytes: &[u8]| image::load_from_memory_with_format(bytes,image::ImageFormat::Png).unwrap().to_rgba8();
-        let fast_pixels = decode(&png);
-        assert_eq!(fast_pixels.dimensions(), (1024,768));
-        assert_eq!(fast_pixels.get_pixel(512,384).0, [23,91,177,255]);
-        assert_eq!(fast_pixels, decode(&original), "fast PNG must be pixel-identical");
+        let pixels = decode(&png);
+        assert_eq!(pixels.dimensions(), (1024,768));
+        assert_eq!(pixels.get_pixel(512,384).0, [23,91,177,255]);
         delayed.resize(1200,1000).unwrap();
-        assert!(!fast_png_allowed(*delayed.viewport.lock().unwrap()));
         let large = decode(&delayed.screenshot().unwrap());
         assert_eq!(large.dimensions(), (1200,1000));
         drop(delayed);
