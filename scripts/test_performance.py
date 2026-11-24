@@ -111,3 +111,13 @@ class NativeProofTests(unittest.TestCase):
             p.require_native_proof("wk_native_input", "WK_TRUSTED_INPUT_VERIFIED:")
     def test_input_complete_proof(self):
         p.require_native_proof("wk_native_input", "WK_TRUSTED_KEY_VERIFIED:\nWK_TRUSTED_TEXT_VERIFIED:\nWK_TRUSTED_WHEEL_VERIFIED:\nWK_TRUSTED_INPUT_VERIFIED:")
+
+
+class UserLatencyTests(unittest.TestCase):
+    def test_cold_and_warm_are_matched_within_process(self):
+        raw = {"chrome_client_start_ms": [100], "chrome_session_open_ms": [20, 30, 40],
+               "chrome_first_frame_receive_ms": [5, 6, 7]}
+        self.assertEqual(p.user_latency_samples(raw), {"cold_start_open_frame_segments_ms": [125],
+                                                       "warm_open_frame_segments_ms": [36, 47]})
+        with self.assertRaises(RuntimeError):
+            p.user_latency_samples(dict(raw, chrome_session_open_ms=[20]))
