@@ -45,8 +45,11 @@ jobs:
           "$CHROME" --version
           echo "HERDR_CHROME_BINARY=$CHROME" >> "$GITHUB_ENV"
       - name: Test report calculations
-        run: python3 -m unittest discover -s scripts -p test_performance.py -v
-      - name: Compare immutable baseline with candidate
+        run: python3 -m unittest discover -s scripts -p 'test_performance*.py' -v
+      - name: Compare fixed baseline and exact PR base with candidate
+        env:
+          PERF_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PERF_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 scripts/performance.py --suite "${{ matrix.suite }}" --out performance-report
       - name: Upload observations and report
         if: always()

@@ -172,6 +172,45 @@ def percentile(values, p):
 def summarize(data):
     return {"n":len(data),"p50":percentile(data,.50),"p95":percentile(data,.95),"p99":percentile(data,.99)}
 
+def round_order(index, incremental):
+    # Rotate all three positions and reverse direction to reduce order bias.
+    # The first five of six permutations balance each pair's relative order 3:2.
+    if incremental:
+        return (("baseline", "pr_base", "candidate"),
+                ("candidate", "baseline", "pr_base"),
+                ("pr_base", "candidate", "baseline"),
+                ("candidate", "pr_base", "baseline"),
+                ("baseline", "candidate", "pr_base"))[index % 5]
+    return ("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")
+
+def comparison_pairs(rounds, reference):
+    return [{"baseline": pair[reference], "candidate": pair["candidate"]} for pair in rounds]
+
+def resolve_pr_base(head, context):
+    if context["event"] != "pull_request":
+        return None
+    import re
+    base, pr_head = context["pr_base_sha"], context["pr_head_sha"]
+    if not all(isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}", s) for s in (base, pr_head)):
+        raise RuntimeError("missing exact PR head/base provenance")
+    parents = run("git", "show", "-s", "--format=%P", head).split()
+    if parents != [base, pr_head]:
+        raise RuntimeError("candidate is not the exact PR merge commit")
+    return base
+
+def prepare_lock(tree, previous):
+    # Respect committed locks. For uncommitted locks reuse a previously resolved
+    # lock only if the manifest matches byte-for-byte; otherwise resolve anew.
+    lock = tree / "Cargo.lock"
+    if not lock.exists():
+        for other in previous:
+            if (other / "Cargo.toml").read_bytes() == (tree / "Cargo.toml").read_bytes():
+                shutil.copyfile(other / "Cargo.lock", lock)
+                break
+    if not lock.exists():
+        subprocess.run(["cargo", "generate-lockfile"], cwd=tree, check=True, timeout=300)
+    return lock
+
 def compare(rounds, suite):
     if len(rounds) != PAIRS:
         raise RuntimeError(f"{suite}: incomplete pairs")
@@ -210,6 +249,12 @@ def report(data, out):
             fmt=lambda x: " / ".join(f"{x[k]:.4f}" for k in ("p50","p95","p99"))
             delta="N/A" if r["paired_delta_pct"] is None else f"{r['paired_delta_pct']:+.1f}%"
             lines.append(f"| {r['metric']} | {a['n']} | {b['n']} | {fmt(a)} | {fmt(b)} | {delta} | {r['classification']} |")
+    if data.get("incremental_reference_sha"):
+        lines += ["", "## Incremental comparison against PR base", "", f"PR base: `{data['incremental_reference_sha']}`", "", "| Metric | PR base p50 | Candidate p50 | Paired delta | Signal |", "|---|---:|---:|---:|---|"]
+        for suite, rows in data["incremental_comparison"].items():
+            for r in rows:
+                delta="N/A" if r["paired_delta_pct"] is None else f"{r['paired_delta_pct']:+.1f}%"
+                lines.append(f"| {r['metric']} | {r['baseline']['p50']:.4g} | {r['candidate']['p50']:.4g} | {delta} | {r['classification']} |")
     lines += ["","## Coverage and limitations", "", "- No full Herdr host dispatch, GPUI main-thread latency, presentation FPS, input-to-display latency, or full WebKit XPC process accounting in this standalone repo. Not measured; no claims.",
               "- Chrome first frame receive starts after session open; click latency ends at observed DOM, not display. WK metrics are full real smoke workload wall time including fixed waits and startup/teardown.",
               "- RSS is sampled peak, not exact high-water mark; descendants excludes reparented processes. CPU includes waited children and sampler overhead. Shared memory may be counted multiple times.",
@@ -232,7 +277,8 @@ def main():
     out.mkdir(parents=True,exist_ok=True)
     native=args.suite=="native"
     head=run("git","rev-parse","HEAD")
-    data={"schema":1,"baseline_sha":BASELINE,"candidate_sha":head,"status":"failed","comparison":{},"rounds":{},"errors":[],
+    data={"schema":2,"baseline_sha":BASELINE,"candidate_sha":head,"incremental_reference_sha":None,"status":"failed","comparison":{},"incremental_comparison":{},"rounds":{},"round_order":{},"errors":[],
+          "context":{"run_id":os.getenv("GITHUB_RUN_ID"),"run_attempt":os.getenv("GITHUB_RUN_ATTEMPT"),"event":os.getenv("GITHUB_EVENT_NAME"),"suite":args.suite,"pr_head_sha":os.getenv("PERF_PR_HEAD_SHA"),"pr_base_sha":os.getenv("PERF_PR_BASE_SHA")},
           "environment":{"platform":platform.platform(),"machine":platform.machine(),"cpu_count":os.cpu_count(),"runner_image":os.getenv("ImageVersion"),"runner_os":os.getenv("RUNNER_OS"),"rust":run("rustc","-Vv"),"cargo":run("cargo","-V")},
           "workload_sha256":{p.name:digest(p) for p in (ROOT/"benchmarks").glob("*.rs")},"lock_sha256":{}}
     if native:
@@ -246,22 +292,24 @@ def main():
         server=None
         try:
             bins={}
-            for side, sha in (("baseline",BASELINE),("candidate",head)):
+            pr_base=resolve_pr_base(head, data["context"])
+            data["incremental_reference_sha"]=pr_base
+            distinct_base=pr_base is not None and pr_base != BASELINE
+            revisions=[("baseline",BASELINE)]
+            if distinct_base:
+                revisions.append(("pr_base",pr_base))
+            revisions.append(("candidate",head))
+            for side, revision in revisions:
                 tree=tmp/side
-                subprocess.run(["git","worktree","add","--detach",str(tree),sha],cwd=ROOT,check=True)
+                subprocess.run(["git","worktree","add","--detach",str(tree),revision],cwd=ROOT,check=True)
+                previous=list(reversed(list(trees.values())))
                 trees[side]=tree
-                # Baseline has no committed lock. Resolve it once, then reuse for
-                # candidate unless its manifest/committed lock deliberately changes.
-                lock=tree/"Cargo.lock"
-                if not lock.exists() and side=="candidate":
-                    shutil.copyfile(trees["baseline"]/"Cargo.lock",lock)
-                if not lock.exists():
-                    subprocess.run(["cargo","generate-lockfile"],cwd=tree,check=True,timeout=300)
-                if side=="candidate" and not (trees["baseline"]/"Cargo.toml").read_bytes()==(tree/"Cargo.toml").read_bytes():
-                    subprocess.run(["cargo","generate-lockfile"],cwd=tree,check=True,timeout=300)
+                lock=prepare_lock(tree, previous)
                 data["lock_sha256"][side]=digest(lock)
                 shutil.copyfile(lock,out/(side+".Cargo.lock"))
                 bins[side]=build(tree,native,tmp/(side+"-target"))
+            if pr_base == BASELINE:
+                data["lock_sha256"]["pr_base"]=data["lock_sha256"]["baseline"]
             server=http.server.ThreadingHTTPServer(("127.0.0.1",0),Fixture)
             thread=threading.Thread(target=server.serve_forever,daemon=True)
             thread.start()
@@ -269,9 +317,10 @@ def main():
             suites=["chrome","wk_native_pixels","wk_native_input"] if native else ["portable"]
             for suite in suites:
                 rounds=data["rounds"][suite]=[]
+                orders=data["round_order"][suite]=[]
                 for i in range(PAIRS):
                     pair={}
-                    order=("baseline","candidate") if i%2==0 else ("candidate","baseline")
+                    order=round_order(i, distinct_base)
                     for side in order:
                         work=tmp/f"{suite}-{i}-{side}"
                         work.mkdir()
@@ -279,8 +328,13 @@ def main():
                         print(f"Measuring {suite} pair {i+1}/{PAIRS} {side}", flush=True)
                         samples,meta=measure(binary,suite,work,url,out/f"{suite}-{i}-{side}.log")
                         pair[side]={"samples":samples,"meta":meta}
+                    if pr_base == BASELINE:
+                        pair["pr_base"]=pair["baseline"]
                     rounds.append(pair)
-                data["comparison"][suite]=compare(rounds,suite)
+                    orders.append(list(order))
+                data["comparison"][suite]=compare(comparison_pairs(rounds,"baseline"),suite)
+                if pr_base:
+                    data["incremental_comparison"][suite]=compare(comparison_pairs(rounds,"pr_base"),suite)
             data["status"]="measured"
         except Exception as exc:
             data["errors"].append(str(exc))

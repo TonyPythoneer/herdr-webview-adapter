@@ -1,4 +1,7 @@
 import unittest
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
 import performance as p
 
 class ComparisonTests(unittest.TestCase):
@@ -20,6 +23,55 @@ class ComparisonTests(unittest.TestCase):
         pair["candidate"]["meta"]={"chrome_version":"different"}
         with self.assertRaises(RuntimeError):
             p.compare([pair]*p.PAIRS,"test")
+
+class IncrementalHarnessTests(unittest.TestCase):
+    def test_round_order_and_candidate_reuse(self):
+        orders = [p.round_order(i, True) for i in range(p.PAIRS)]
+        self.assertEqual(len(set(orders)), p.PAIRS)
+        for order in orders:
+            self.assertEqual(set(order), {"baseline", "pr_base", "candidate"})
+        for a, b in (("baseline", "candidate"), ("pr_base", "candidate"), ("baseline", "pr_base")):
+            self.assertIn(sum(o.index(a) < o.index(b) for o in orders), (2, 3))
+        candidate = {"samples": {"metric": [80]}, "meta": {}}
+        rounds = [{"baseline": {"samples": {"metric": [100]}, "meta": {}},
+                   "pr_base": {"samples": {"metric": [60]}, "meta": {}}, "candidate": candidate}] * p.PAIRS
+        fixed = p.comparison_pairs(rounds, "baseline")
+        incremental = p.comparison_pairs(rounds, "pr_base")
+        self.assertIs(fixed[0]["candidate"], incremental[0]["candidate"])
+        self.assertEqual(p.compare(fixed, "test")[0]["classification"], "improvement signal")
+        self.assertEqual(p.compare(incremental, "test")[0]["classification"], "regression signal")
+
+    def test_resolve_exact_merge_parents(self):
+        context = {"event": "pull_request", "pr_base_sha": "a" * 40, "pr_head_sha": "b" * 40}
+        with patch.object(p, "run", return_value="a" * 40 + " " + "b" * 40):
+            self.assertEqual(p.resolve_pr_base("c" * 40, context), "a" * 40)
+        with patch.object(p, "run", return_value="d" * 40 + " " + "b" * 40):
+            with self.assertRaises(RuntimeError):
+                p.resolve_pr_base("c" * 40, context)
+        with self.assertRaises(RuntimeError):
+            p.resolve_pr_base("c" * 40, dict(context, pr_base_sha="main"))
+        self.assertIsNone(p.resolve_pr_base("c" * 40, {"event": "push"}))
+
+    def test_lock_reuse_and_preserve_committed_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, prior, candidate = [Path(tmp) / name for name in ("base", "prior", "candidate")]
+            for tree in (base, prior, candidate):
+                tree.mkdir()
+                (tree / "Cargo.toml").write_text("same")
+            (base / "Cargo.lock").write_text("baseline lock")
+            (prior / "Cargo.lock").write_text("PR base lock")
+            with patch.object(p.subprocess, "run") as run:
+                self.assertEqual(p.prepare_lock(candidate, [prior, base]).read_text(), "PR base lock")
+                (candidate / "Cargo.lock").write_text("committed candidate lock")
+                self.assertEqual(p.prepare_lock(candidate, [prior, base]).read_text(), "committed candidate lock")
+                run.assert_not_called()
+            (candidate / "Cargo.lock").unlink()
+            (candidate / "Cargo.toml").write_text("changed manifest")
+            def generate(*args, **kwargs):
+                (candidate / "Cargo.lock").write_text("new lock")
+            with patch.object(p.subprocess, "run", side_effect=generate) as run:
+                self.assertEqual(p.prepare_lock(candidate, [prior, base]).read_text(), "new lock")
+                run.assert_called_once()
 
 class NativeProofTests(unittest.TestCase):
     def test_pixel_missing_final_proof_fails(self):
