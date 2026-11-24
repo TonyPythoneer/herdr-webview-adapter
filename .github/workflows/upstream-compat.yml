@@ -50,16 +50,42 @@ jobs:
           }
           commit="$(git -C "$upstream" rev-parse 'FETCH_HEAD^{commit}')"
           git -C "$upstream" checkout -q FETCH_HEAD -- src/window.rs src/mods.rs src/commands.rs Cargo.toml
+          # Resolve dependency changes before creating a branch, PR, or CI run.
+          read -r adapter_core upstream_core < <(python3 -c 'import sys; sys.path.insert(0,"scripts"); from coordinated_deps import host_core; from pathlib import Path; print(host_core(Path("Cargo.toml").read_text()),host_core(Path(sys.argv[1]).read_text()))' "$upstream/Cargo.toml")
+          if [[ "$adapter_core" != "$upstream_core" ]]; then
+            host_sha="$(git ls-remote https://github.com/TonyPythoneer/herdr-webview.git refs/heads/master | cut -f1)"
+            [[ "$host_sha" =~ ^[0-9a-f]{40}$ ]]
+            curl --fail --silent --show-error --retry 3 --max-time 30 \
+              "https://raw.githubusercontent.com/TonyPythoneer/herdr-webview/$host_sha/Cargo.toml" \
+              -o "$RUNNER_TEMP/host-Cargo.toml"
+            if python3 scripts/coordinated_deps.py --adapter Cargo.toml --upstream "$upstream/Cargo.toml" --host "$RUNNER_TEMP/host-Cargo.toml"; then
+              rustup toolchain install 1.95.0 --profile minimal
+              if ! cargo +1.95.0 metadata --format-version 1 > "$RUNNER_TEMP/coordinated-metadata.json"; then
+                echo "::warning::Candidate failed Cargo dependency resolution. No dependency PR or test CI created."
+                exit 0
+              fi
+            else
+              code=$?
+              if [[ "$code" == 3 ]]; then exit 0; fi
+              exit "$code"
+            fi
+          fi
+          python3 scripts/upstream_compat.py probe --source "$upstream" --tag "$tag" --sha "$commit" --tag-object-sha "$object_sha" > .github/upstream-compat.json
+          if [[ "$adapter_core" != "$upstream_core" ]]; then
+            if ! python3 scripts/upstream_compat.py gate .github/upstream-compat.json; then
+              echo "::warning::Candidate fails upstream compatibility gate. No dependency PR or test CI created."
+              exit 0
+            fi
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -b "$branch"
-          python3 scripts/upstream_compat.py probe --source "$upstream" --tag "$tag" --sha "$commit" --tag-object-sha "$object_sha" > .github/upstream-compat.json
-          git add .github/upstream-compat.json
+          git add Cargo.toml .github/upstream-compat.json
           git commit -m "chore(compat): audit upstream $tag"
           git push origin "HEAD:refs/heads/$branch"
           compatible="$(python3 -c 'import json; print(json.load(open(".github/upstream-compat.json"))["compatible"])')"
           gh pr create -R "$GH_REPO" -B main -H "$branch" \
             -t "chore(compat): review upstream $tag" \
-            -b "Static upstream compatibility report for herdrdev/herdr-app@$tag ($commit). Anchor and GPUI check: $compatible. If incompatible, CI blocks merge until Adapter code is fixed. This does not automatically change the Host; packaged-app E2E is still required."
+            -b "Static upstream compatibility report for herdrdev/herdr-app@$tag ($commit). Anchor and GPUI check: $compatible. Any coordinated GPUI dependency changes were resolved before PR creation. This does not automatically change the Host; packaged-app E2E is still required."
           # GITHUB_TOKEN PR creation does not trigger pull_request CI.
           gh workflow run ci.yml -R "$GH_REPO" --ref "$branch"
