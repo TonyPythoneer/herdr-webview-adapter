@@ -586,7 +586,7 @@ mod tests {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
                         let n = connection.read(&mut request).unwrap_or(0);
-                        // A deferred script keeps readyState at "loading" while
+                        // A parser-blocking script keeps readyState at "loading" while
                         // the actual target exists, exercising readiness wakeups.
                         if request[..n].starts_with(b"GET /delayed.js ") {
                             std::thread::sleep(Duration::from_millis(250));
@@ -595,7 +595,7 @@ mod tests {
                             continue;
                         }
                         if request[..n].starts_with(b"GET /delayed ") {
-                            let body = "<html><head><title>Loading</title><script defer src='/delayed.js'></script></head><body>Delayed document</body></html>";
+                            let body = "<html><head><title>Loading</title><script src='/delayed.js'></script></head><body>Delayed document</body></html>";
                             let _ = write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                             continue;
                         }
@@ -711,14 +711,8 @@ mod tests {
         let delayed = client.open(&format!("http://{address}/delayed"))
             .expect("delayed document must become interactive before screencast");
         let state = delayed.eval("({title:document.title,ready:document.readyState})").unwrap();
-        // 'interactive' can precede defer execution; only the original readiness
-        // contract is required at return. The title must subsequently arrive.
         assert!(matches!(state["ready"].as_str(), Some("interactive" | "complete")));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while delayed.eval("document.title").unwrap() != "Herdr delayed fixture" {
-            assert!(Instant::now() < deadline, "deferred document script never ran");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert_eq!(state["title"], "Herdr delayed fixture");
         assert!(delayed.frame_timeout(Duration::from_secs(10)).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
         drop(delayed);
         drop(client);
