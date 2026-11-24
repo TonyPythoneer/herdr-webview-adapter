@@ -162,6 +162,24 @@ fn wait_for_document_hint(receiver: &Receiver<()>) {
     }
 }
 
+// Avoid a temporary envelope Value and owned method/session strings.
+// Every dynamic value still goes through serde_json's encoder.
+fn encode_command(id: u64, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"{\"id\":");
+    serde_json::to_writer(&mut bytes, &id).map_err(|e| e.to_string())?;
+    bytes.extend_from_slice(b",\"method\":");
+    serde_json::to_writer(&mut bytes, method).map_err(|e| e.to_string())?;
+    bytes.extend_from_slice(b",\"params\":");
+    serde_json::to_writer(&mut bytes, params).map_err(|e| e.to_string())?;
+    if let Some(session) = session {
+        bytes.extend_from_slice(b",\"sessionId\":");
+        serde_json::to_writer(&mut bytes, session).map_err(|e| e.to_string())?;
+    }
+    bytes.extend_from_slice(b"}\0");
+    Ok(bytes)
+}
+
 pub struct Client {
     child: Mutex<Child>,
     writer: Mutex<File>,
@@ -282,12 +300,7 @@ impl Client {
     }
 
     fn write_message(&self, id: u64, method: &str, params: Value, session: Option<&str>) -> Result<(), String> {
-        let mut value = json!({"id":id,"method":method,"params":params});
-        if let Some(session) = session {
-            value["sessionId"] = json!(session);
-        }
-        let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        bytes.push(0);
+        let bytes = encode_command(id, method, &params, session)?;
         self.writer.lock().unwrap().write_all(&bytes)
             .map_err(|e| format!("CDP_DISCONNECTED: {e}"))
     }
@@ -672,6 +685,21 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(discover_candidate(&path, &cache, |_| panic!("not executable")).is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_command_encoding_matches_previous_json_and_delimiter() {
+        for session in [None, Some("session-\"\\\0日本語")] {
+            for params in [json!({}), json!({"nested":[null, true, 42, "a\0b\n\"日本語"]}), json!({"data":"x".repeat(1024*1024)})] {
+                let method = "Runtime.evaluate\"\\\0";
+                let mut expected = json!({"id":u64::MAX,"method":method,"params":params.clone()});
+                if let Some(value) = session { expected["sessionId"] = json!(value); }
+                let encoded = encode_command(u64::MAX, method, &params, session).unwrap();
+                assert_eq!(encoded.last(), Some(&0));
+                assert!(!encoded[..encoded.len()-1].contains(&0));
+                assert_eq!(serde_json::from_slice::<Value>(&encoded[..encoded.len()-1]).unwrap(), expected);
+            }
+        }
     }
 
     #[test]
