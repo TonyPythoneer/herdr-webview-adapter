@@ -308,7 +308,7 @@ impl Render for ChromeView {
 
 #[cfg(test)]
 mod frame_tests {
-    use super::*;
+    use super::{decode_frame, decode_frame_pixels};
     #[test]
     fn png_conversion_preserves_bgra_pixels() {
         let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(3, 2, image::Rgba([17, 91, 201, 113])));
