@@ -1,0 +1,36 @@
+name: adapter-mmap-file-probe
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/mmap_file_probe.py'
+      - '.github/workflows/mmap-file-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mmap-file-probe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  experiment:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Run independent experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe-report
+          git rev-parse HEAD > probe-report/revision.txt
+          sw_vers > probe-report/environment.txt
+          python3 scripts/mmap_file_probe.py --out probe-report/mmap.json | tee probe-report/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mmap-file-probe-${{ github.run_attempt }}
+          path: probe-report/
+          if-no-files-found: warn
+          retention-days: 30

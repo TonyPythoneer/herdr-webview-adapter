@@ -55,14 +55,12 @@ impl ChromeView {
                         this._frames = Some(cx.spawn(async move |this, cx| {
                             loop {
                                 let reader = receiver.clone();
-                                let result = cx.background_executor().spawn(async move {
-                                    reader.frame_timeout(Duration::from_millis(800))
+                                // Return only the paint-ready image to the foreground.
+                                let decoded = cx.background_executor().spawn(async move {
+                                    let frame = reader.frame_timeout(Duration::from_millis(800))?;
+                                    decode_frame(&frame)
                                 }).await;
-                                let Ok(frame) = result else {
-                                    if this.upgrade().is_none() { break }
-                                    continue;
-                                };
-                                let decoded = cx.background_executor().spawn(async move {decode_frame(&frame)}).await;
+                                if decoded.is_err() && this.upgrade().is_none() { break }
                                 if let Ok(frame) = decoded
                                     && this.update(cx, |this, cx| {
                                         this.frame = Some(frame);
@@ -248,15 +246,20 @@ impl ChromeView {
     }
 }
 
-fn decode_frame(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
+fn decode_frame_pixels(bytes: &[u8]) -> Result<image::RgbaImage, String> {
     if bytes.len() > 12 * 1024 * 1024 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("invalid or oversized Chrome PNG frame".into());
     }
     let mut image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
         .map_err(|e| format!("Chrome PNG decode failed: {e}"))?
-        .to_rgba8();
+        .into_rgba8();
     // gpui-pre's atlas expects BGRA byte ordering, unlike PNG's RGBA.
     for pixel in image.chunks_exact_mut(4) { pixel.swap(0, 2) }
+    Ok(image)
+}
+
+fn decode_frame(bytes: &[u8]) -> Result<Arc<RenderImage>, String> {
+    let image = decode_frame_pixels(bytes)?;
     Ok(Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(image)])))
 }
 
@@ -299,5 +302,25 @@ impl Render for ChromeView {
             .on_scroll_wheel(cx.listener(Self::wheel))
             .on_key_down(cx.listener(Self::key))
             .child(screen)
+    }
+}
+
+
+#[cfg(test)]
+mod frame_tests {
+    use super::{decode_frame, decode_frame_pixels};
+    #[test]
+    fn png_conversion_preserves_bgra_pixels() {
+        let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(3, 2, image::Rgba([17, 91, 201, 113])));
+        let rgb = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 2, image::Rgb([17, 91, 201])));
+        for source in [rgba, rgb] {
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            source.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+            let mut expected = source.to_rgba8();
+            for pixel in expected.chunks_exact_mut(4) { pixel.swap(0, 2) }
+            assert_eq!(decode_frame_pixels(encoded.get_ref()).unwrap(), expected);
+            assert!(decode_frame(encoded.get_ref()).is_ok());
+        }
+        assert!(decode_frame_pixels(b"invalid").is_err());
     }
 }

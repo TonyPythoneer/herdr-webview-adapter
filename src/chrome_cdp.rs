@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{self, BufReader, Read, Write},
-    os::{fd::{FromRawFd, RawFd}, unix::{fs::{MetadataExt, PermissionsExt}, process::CommandExt}},
+    os::{fd::{AsRawFd, FromRawFd, RawFd}, unix::{fs::{MetadataExt, PermissionsExt}, process::CommandExt}},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -162,6 +162,24 @@ fn wait_for_document_hint(receiver: &Receiver<()>) {
     }
 }
 
+// Avoid a temporary envelope Value and owned method/session strings.
+// Every dynamic value still goes through serde_json's encoder.
+fn encode_command(id: u64, method: &str, params: &Value, session: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"{\"id\":");
+    serde_json::to_writer(&mut bytes, &id).map_err(|e| e.to_string())?;
+    bytes.extend_from_slice(b",\"method\":");
+    serde_json::to_writer(&mut bytes, method).map_err(|e| e.to_string())?;
+    bytes.extend_from_slice(b",\"params\":");
+    serde_json::to_writer(&mut bytes, params).map_err(|e| e.to_string())?;
+    if let Some(session) = session {
+        bytes.extend_from_slice(b",\"sessionId\":");
+        serde_json::to_writer(&mut bytes, session).map_err(|e| e.to_string())?;
+    }
+    bytes.extend_from_slice(b"}\0");
+    Ok(bytes)
+}
+
 pub struct Client {
     child: Mutex<Child>,
     writer: Mutex<File>,
@@ -282,12 +300,7 @@ impl Client {
     }
 
     fn write_message(&self, id: u64, method: &str, params: Value, session: Option<&str>) -> Result<(), String> {
-        let mut value = json!({"id":id,"method":method,"params":params});
-        if let Some(session) = session {
-            value["sessionId"] = json!(session);
-        }
-        let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
-        bytes.push(0);
+        let bytes = encode_command(id, method, &params, session)?;
         self.writer.lock().unwrap().write_all(&bytes)
             .map_err(|e| format!("CDP_DISCONNECTED: {e}"))
     }
@@ -417,23 +430,90 @@ impl Client {
 }
 
 
-static SHARED_CHROME: OnceLock<Mutex<Weak<Client>>> = OnceLock::new();
+#[derive(Default)]
+struct SharedChrome {
+    weak: Weak<Client>,
+    // Opt-in experimental lease; never retain multiple browser processes.
+    retained: Option<Arc<Client>>,
+}
+static SHARED_CHROME: OnceLock<Mutex<SharedChrome>> = OnceLock::new();
+
+fn retain_experiment(lock: &'static Mutex<SharedChrome>, client: &Arc<Client>, shared: &mut SharedChrome) {
+    if std::env::var_os("HERDR_EXPERIMENT_CHROME_RETENTION").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    shared.retained = Some(client.clone());
+    let weak = Arc::downgrade(client);
+    // One worker per retained browser, no per-pane timers. The lock serializes
+    // expiry with new acquisitions; never drop the last lease outside it.
+    if std::thread::Builder::new().name("herdr-chrome-idle-lease".into()).spawn(move || {
+        let mut idle_since: Option<Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let Ok(mut state) = lock.lock() else {return};
+            let Some(retained) = state.retained.as_ref() else {return};
+            if !Weak::ptr_eq(&weak, &Arc::downgrade(retained)) {return}
+            if Arc::strong_count(retained) == 1 {
+                let since = *idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(5) {
+                    state.retained = None;
+                    return;
+                }
+            } else {idle_since = None;}
+        }
+    }).is_err() { shared.retained = None; }
+}
+
 
 /// All Chrome panes share one headless Chrome process and a private profile.
 /// The mutex prevents concurrent pane creation from racing on the profile lock.
 pub fn shared_client() -> Result<Arc<Client>, String> {
-    let lock = SHARED_CHROME.get_or_init(|| Mutex::new(Weak::new()));
+    let lock = SHARED_CHROME.get_or_init(|| Mutex::new(SharedChrome::default()));
     let mut shared = lock.lock().unwrap();
-    if let Some(client) = shared.upgrade() { return Ok(client); }
+    if let Some(client) = shared.weak.upgrade() {
+        // A dead retained browser must not be handed to a newly opened pane.
+        let alive = client.child.lock().map_err(|_| "Chrome child lock poisoned")?
+            .try_wait().map_err(|e| e.to_string())?.is_none();
+        if alive { return Ok(client); }
+        shared.retained = None;
+        if Arc::strong_count(&client) != 1 {
+            return Err("CDP_DISCONNECTED: close existing Chrome panes before retry".into());
+        }
+        drop(client);
+    }
     let chrome = discover()?;
     let client = Client::start(&chrome, &persistent_profile())?;
-    *shared = Arc::downgrade(&client);
+    shared.weak = Arc::downgrade(&client);
+    retain_experiment(lock, &client, &mut shared);
     Ok(client)
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
+            // Only the last Arc is dropping. No live caller can write concurrently.
+            // Nonblocking tiny Browser.close request; fallback to the existing kill
+            // path on any failure or if the bounded grace period expires.
+            if std::env::var_os("HERDR_EXPERIMENT_GRACEFUL_CLOSE").as_deref() == Some(std::ffi::OsStr::new("1"))
+                && let Ok(writer) = self.writer.get_mut()
+            {
+                let fd = writer.as_raw_fd();
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0 {
+                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                    let message = format!("{{\"id\":{id},\"method\":\"Browser.close\",\"params\":{{}}}}\0");
+                    if writer.write_all(message.as_bytes()).is_ok() {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while Instant::now() < deadline {
+                            match child.try_wait() {
+                                Ok(Some(status)) => { tracing::debug!(?status, "Chrome exited after Browser.close"); return; }
+                                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -631,6 +711,21 @@ mod tests {
     }
 
     #[test]
+    fn direct_command_encoding_matches_previous_json_and_delimiter() {
+        for session in [None, Some("session-\"\\\0日本語")] {
+            for params in [json!({}), json!({"nested":[null, true, 42, "a\0b\n\"日本語"]}), json!({"data":"x".repeat(1024*1024)})] {
+                let method = "Runtime.evaluate\"\\\0";
+                let mut expected = json!({"id":u64::MAX,"method":method,"params":params.clone()});
+                if let Some(value) = session { expected["sessionId"] = json!(value); }
+                let encoded = encode_command(u64::MAX, method, &params, session).unwrap();
+                assert_eq!(encoded.last(), Some(&0));
+                assert!(!encoded[..encoded.len()-1].contains(&0));
+                assert_eq!(serde_json::from_slice::<Value>(&encoded[..encoded.len()-1]).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn document_ready_hints_are_bounded_and_only_lifecycle_events() {
         assert!(is_document_ready_event("Page.domContentEventFired"));
         assert!(is_document_ready_event("Page.loadEventFired"));
@@ -668,6 +763,47 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    fn read_fixture_headers(connection: &mut std::net::TcpStream, request: &mut [u8]) -> io::Result<usize> {
+        // macOS passes the listener's O_NONBLOCK flag to accepted sockets.
+        connection.set_nonblocking(false)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut n = 0;
+        while n < request.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            connection.set_read_timeout(Some(remaining))?;
+            match connection.read(&mut request[n..]) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => n += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+            if request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                return Ok(n);
+            }
+        }
+        Err(io::ErrorKind::InvalidData.into())
+    }
+
+    #[test]
+    fn fixture_reads_fragmented_headers_on_a_nonblocking_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut connection, _) = listener.accept().unwrap();
+        connection.set_nonblocking(true).unwrap();
+        client.write_all(b"GET /delayed").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b".js HTTP/1.1\r\n\r\n").unwrap();
+        });
+        let mut request = [0; 4096];
+        let n = read_fixture_headers(&mut connection, &mut request).unwrap();
+        assert_eq!(&request[..n], b"GET /delayed.js HTTP/1.1\r\n\r\n");
+        writer.join().unwrap();
+    }
+
     #[test]
     fn chrome_real_cdp_fixture() {
         if std::env::var_os("HERDR_CHROME_E2E").is_none() { return }
@@ -683,17 +819,13 @@ mod tests {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
                         let mut request = [0u8; 4096];
-                        // TCP may split a request line between reads. Read the
-                        // bounded complete headers, not a single arbitrary chunk.
-                        let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
-                        let mut n = 0;
-                        while n < request.len() && !request[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                            match connection.read(&mut request[n..]) {
-                                Ok(0) | Err(_) => break,
-                                Ok(count) => n += count,
+                        let n = match read_fixture_headers(&mut connection, &mut request) {
+                            Ok(n) => n,
+                            Err(error) => {
+                                eprintln!("Chrome fixture skipped incomplete request: {error}");
+                                continue;
                             }
-                        }
-                        if !request[..n].windows(4).any(|w| w == b"\r\n\r\n") { continue }
+                        };
                         // A parser-blocking script keeps readyState at "loading" while
                         // the actual target exists, exercising readiness wakeups.
                         if request[..n].starts_with(b"GET /delayed.js ") {
