@@ -38,22 +38,25 @@ def norm(data, matrix):
     return f.normalize_suite(data, matrix, 12, 2, "pull_request", HEAD)
 
 class FeedbackTests(unittest.TestCase):
-    def test_complete_and_prioritized_regression(self):
+    def test_legacy_pr_requires_direct_evidence(self):
         suites = {s: norm(fixture(s), s) for s in f.SUITES}
         report = f.assemble(RUN, suites, [], 7)
         self.assertEqual(report["status"], "complete")
         self.assertEqual(report["pr_base_shas"], [BASE])
         self.assertGreater(report["signals"]["regression_signal"], 0)
-        self.assertEqual(report["next_actions"][0]["priority"], "P1")
+        self.assertEqual(report["decision"]["primary_action"]["priority"], "P0")
+        self.assertEqual(report["decision"]["scope"], "unavailable")
+        self.assertIsNone(report["decision"]["signals"])
+        self.assertEqual(report["decision"]["primary_action"]["reason"], "missing_incremental_comparison")
         self.assertEqual(suites["portable"]["metrics"][0]["baseline"]["n"], 500)
         self.assertAlmostEqual(suites["portable"]["metrics"][0]["paired_delta_pct"], 20)
         self.assertIn("not proof of this PR", f.render_comment(report, REPO, 99))
         self.assertIn("benchmark-feedback.json", f.render_comment(report, REPO, 99))
 
     def test_hotspots_and_lock_confounder(self):
-        data = fixture("native", 1)
+        data = incremental_fixture("native", 1)
         data["lock_sha256"]["candidate"] = "f" * 64
-        suites = {"native": norm(data, "native"), "portable": norm(fixture("portable", 1), "portable")}
+        suites = {"native": norm(data, "native"), "portable": norm(incremental_fixture("portable", 1), "portable")}
         report = f.assemble(RUN, suites, [])
         self.assertEqual(report["next_actions"][0]["reason"], "dependency_resolution_differs")
         self.assertTrue(any(x.get("priority") == "P2" and x.get("metric") for x in report["next_actions"]))
@@ -139,6 +142,8 @@ class IncrementalTests(unittest.TestCase):
         self.assertGreater(report["signals"]["regression_signal"], 0)
         self.assertGreater(report["incremental"]["signals"]["improvement_signal"], 0)
         self.assertFalse(any(a.get("scope") == "incremental" and a.get("priority") == "P1" for a in report["next_actions"]))
+        self.assertEqual(report["decision"]["outcome"], "improvement_signal")
+        self.assertEqual(report["decision"]["primary_action"]["reason"], "review_improvement_signal")
         row = suites["portable"]["incremental_metrics"][0]
         self.assertAlmostEqual(row["paired_delta_pct"], -20)
         self.assertEqual(row["raw_samples_by_pair"]["candidate"], suites["portable"]["metrics"][0]["raw_samples_by_pair"]["candidate"])
@@ -146,7 +151,14 @@ class IncrementalTests(unittest.TestCase):
 
     def test_incremental_regression_despite_cumulative_improvement(self):
         suites = {s: norm(incremental_fixture(s, .8, .6), s) for s in f.SUITES}
+        suites["native"]["lock_sha256"]["candidate"] = "f" * 64
         report = f.assemble(RUN, suites, [])
+        self.assertEqual(report["decision"]["outcome"], "regression_signal")
+        self.assertEqual(report["decision"]["lock_drift_suites"], ["native"])
+        summary = f.render_comment(report, REPO, 99).split("<details>")[0]
+        self.assertIn("locks differ in native", summary)
+        self.assertIn(report["decision"]["primary_action"]["metric"], summary)
+        self.assertIn("Paired median", summary)
         self.assertGreater(report["signals"]["improvement_signal"], 0)
         self.assertGreater(report["incremental"]["signals"]["regression_signal"], 0)
         self.assertEqual(report["next_actions"][0]["scope"], "incremental")
@@ -188,6 +200,40 @@ class IncrementalTests(unittest.TestCase):
         data["round_order"] = {"portable": [["baseline", "candidate"] if i % 2 == 0 else ["candidate", "baseline"] for i in range(f.PAIRS)]}
         result = f.normalize_suite(data, "portable", 12, 2, "push", HEAD)
         self.assertEqual(result["incremental_status"], "not_applicable")
+
+    def test_cumulative_only_summary(self):
+        for event in ("push", "workflow_dispatch"):
+            suites = {}
+            for name in f.SUITES:
+                data = fixture(name, 1)
+                data["context"]["event"] = event
+                data["candidate_sha"] = HEAD
+                suites[name] = f.normalize_suite(data, name, 12, 2, event, HEAD)
+            report = f.assemble(dict(RUN, event=event), suites, [])
+            self.assertEqual(report["decision"]["scope"], "cumulative")
+            self.assertEqual(report["decision"]["outcome"], "inconclusive")
+            self.assertIn("Fixed baseline vs candidate", f.render_comment(report, REPO, 99).split("<details>")[0])
+
+    def test_hotspot_links_from_first_screen_to_stack(self):
+        suites = {s: norm(incremental_fixture(s, 1), s) for s in f.SUITES}
+        # Make screenshots the largest accumulated cost without changing a paired delta.
+        for row in suites["native"]["metrics"]:
+            if row["metric"] == "chrome_screenshot_png_ms":
+                row["candidate_median_sum_per_pair"] = 9999
+        suites["native"]["artifact_id"] = 456
+        suites["native"]["profiling"] = {"status": "measured", "probes": [
+            {"operation": "screenshot", "status": "measured", "source_log": "profile-screenshot.sample.txt",
+             "operations": 42, "top_stack_counts": {"wait_or_sleep": 10}}]}
+        report = f.assemble(RUN, suites, [])
+        decision = report["decision"]
+        self.assertEqual(decision["scope"], "incremental")
+        self.assertEqual(decision["signals"]["inconclusive"], 23)
+        self.assertEqual(decision["primary_action"], report["next_actions"][0])
+        self.assertEqual(decision["primary_action"]["suite"], "native")
+        summary = f.render_comment(report, REPO, 99).split("<details>")[0]
+        for expected in ("23 inconclusive", "9,999.0 ms", "profile-screenshot.sample.txt", "/runs/12/artifacts/456"):
+            self.assertIn(expected, summary)
+        self.assertNotIn("| Metric |", summary)
 
 class PublishingTests(unittest.TestCase):
     def test_only_bot_owned_comment(self):

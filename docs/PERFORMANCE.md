@@ -57,6 +57,32 @@ feedback. Forks retain their original unprivileged artifacts.
    instead of claiming success. No automatic self-modifying code or merge
    based solely on benchmark feedback.
 
+### Proposed CI feedback architecture
+
+Make the first screen answer three questions. What can we conclude about this PR? Which observation deserves investigation? What evidence would change the decision? The existing paired runner, trusted reporter and bot comment already provide the delivery path. The first change belongs in the reporter and can be tested by replaying saved evidence.
+
+**Implemented reporter contract.** Read `decision.scope`, `outcome`, `signals`, `primary_action` and `lock_drift_suites` in the v2 artifact. A complete PR uses incremental signals. An incomplete PR comparison yields unavailable scope, null signal counts and a P0 action. Push and dispatch use cumulative scope when complete. The primary action is the first entry of `next_actions`. A metric-specific action identifies its suite and any matching probe and verified stack filename. Samples, full hashes and environment remain in their existing fields. Older v2 artifacts can be replayed from their source runs. `render_comment()` uses the same decision for the first visible section and groups the detailed tables in a disclosure. Keeping selection in one function makes disagreement between the JSON and the comment testable. The trusted reporter owns the vocabulary and builds links from validated identifiers.
+
+| Evidence available | Primary action for this run |
+|---|---|
+| Failed correctness check, rejected evidence, or a PR missing its direct comparison | P0. Identify the failing check or missing suite and link its log. Show benchmark coverage and correctness as separate states. Resolve correctness by exact revision from the correctness workflow. Show pending or unknown until a matching result exists. |
+| Complete PR comparison with a regression signal | P1. Show the affected operation, paired change and range. Check reference and candidate locks, then reproduce the signal. A dependency mismatch limits attribution to a source edit. |
+| Complete comparison with inconclusive changes | P2. Show the highest accumulated operation cost within the measured Chrome workload. Link the specific stack or name the missing observation. A noisy percentage alone cannot justify an edit. |
+| Primary experiment metric meets the improvement screen | Show the measured effect and any competing regression first. Check guardrail metrics, correctness and manual native Host E2E before a maintainer decides whether to retain the change. |
+| Main push or dispatch with only the fixed baseline | Label the result as cumulative. It can identify a costly operation for a future experiment. PR impact requires a direct PR-base comparison. |
+
+**What a reviewer would see on PR #28.** Lead the comment with the following compact result. Put full metric tables, cumulative history and CI build/cache time behind expandable sections. Keep native proof and raw stacks in the original artifacts.
+
+> **PR-base comparison complete.** All five rounds completed for each workload. All 23 metrics were inconclusive. Shutdown had a +26.3% paired median, with individual pairs from −17.4% to +70.9%.
+>
+> **Next investigation · Chrome screenshot.** Screenshot calls accumulated 1.46 s per candidate process at the median, the largest measured Chrome operation cost. Their direct paired change was +4.2%, inconclusive. The screenshot probe sampled the caller waiting in `Client::request` and the reader waiting in `read`. A diagnostic that separates request-to-reply time from post-reply handling would distinguish two possible places to investigate.
+
+This example uses source run `45447612867`, attempt 1, head `ad55b389e5d2fb83b12ea7519cd147b2d0d5486d`, measured merge candidate `77b2020d1cacd40f567a8a7882cb125cb90e91c6`, PR base `348469f6ea236506d2bb1ff18cf07a49d9013bfd` and fixed baseline `acf81de1738bf6ef2e4f6194208eb268e7523842`. The workload.rs hash was `b99f8637962f9b7da797a15608045c0616b4e23ce6f341d56d00d5c00e5d71c4`. The native PR base and candidate shared lock hash `f281b5c2563d9dd46b2b3cf56207444de2ae7348b4cef4e2796a899612ae367e`. The stack is `profile-screenshot.sample.txt` in native artifact `14948515704`. [PR feedback](https://github.com/TonyPythoneer/herdr-webview-adapter/pull/28#issuecomment-7138809357) · [Normalized artifact](https://github.com/TonyPythoneer/herdr-webview-adapter/actions/runs/45449291962) · [Native artifact](https://github.com/TonyPythoneer/herdr-webview-adapter/actions/runs/45447612867/artifacts/14948515704)
+
+**Close the loop in the experiment PR.** Before an edit, the author records the source run, one falsifiable hypothesis, the primary metric and direction, guardrails and the observation that would falsify the hypothesis. For the screenshot example, first test whether most of the operation elapses before the reply arrives. If the split shows most time after the reply, investigate local handling. If the wait dominates, investigate the request path. Either outcome narrows the search even when it yields no production change. Run any new diagnostic after timed rounds and keep its observations separate. After the next exact-SHA comparison, record the result and the maintainer's disposition in that PR. Later agents can find why an experiment stopped before repeating it.
+
+**Rollout and acceptance.** First replay PR #28 through the revised renderer and assert that the first visible section and JSON agree on scope, 23 inconclusive metrics and the selected screenshot probe. Add fixtures for a missing direct comparison, a regression with lock drift and a cumulative-only run. Verify a reader can identify the comparison, conclusion and evidence link before expanding any table. The reporter currently summarizes the performance workflow. As a follow-up, integrate exact-SHA correctness status and test pending, failed and stale results. These changes need no new macOS measurements. Budget a targeted diagnostic only when the existing artifact leaves a specific question open.
+
 ## Phase 4 — Incremental comparison
 
 PR-triggered runs verify that the checked-out synthetic merge commit has the exact
