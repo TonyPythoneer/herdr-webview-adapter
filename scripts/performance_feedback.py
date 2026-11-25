@@ -334,20 +334,29 @@ def assemble(run, suites, problems, pr_number=None):
                           "complete" if incremental_complete else "unavailable_or_partial")
     # Use direct PR-base evidence for current changes; cumulative signals are
     # historical context, never attributed to the current PR.
-    decision_rows = incremental_rows if incremental_complete else rows
+    blocked = not complete or incremental_status == "unavailable_or_partial"
+    decision_rows = [] if blocked else (incremental_rows if incremental_complete else rows)
+    counts = signal_counts(decision_rows) if decision_rows else None
     scope = "incremental" if incremental_complete else "cumulative"
     regressions = sorted((r for r in decision_rows if r["signal"] == "regression_signal"), key=lambda r: -r["paired_delta_pct"])
     priorities = []
     if not complete:
         priorities.append({"priority": "P0", "action": "restore complete verified benchmark coverage; inspect original CI jobs/logs", "reason": "failed_or_partial_measurement"})
+    elif blocked:
+        priorities.append({"priority": "P0", "action": "obtain a complete comparison against the exact PR base", "reason": "missing_incremental_comparison"})
     lock_reference = "pr_base" if incremental_complete else "baseline"
-    if any(s["lock_sha256"].get(lock_reference) != s["lock_sha256"].get("candidate") for s in suites.values()):
-        priorities.append({"priority": "P1", "action": "isolate dependency changes before attributing latency changes to code", "reason": "dependency_resolution_differs"})
+    drift = [s["suite"] for s in suites.values() if s["lock_sha256"].get(lock_reference) != s["lock_sha256"].get("candidate")]
     for row in regressions:
-        priorities.append({"priority": "P1", "scope": scope, "metric": row["metric"], "paired_delta_pct": row["paired_delta_pct"],
+        priorities.append({"priority": "P1", "scope": scope, "metric": row["metric"], "reason": "regression_signal",
+                           "paired_delta_pct": row["paired_delta_pct"], "pair_delta_range_pct": row["pair_delta_range_pct"],
                            "source_candidates": row["source_candidates"],
                            "action": ("reproduce the incremental regression with matching locks; profile before proposing a change" if incremental_complete else "reproduce against PR base with matching locks; cumulative signal is not attributable to this PR")})
-    if complete and not regressions:
+    if drift and not blocked:
+        priorities.append({"priority": "P1", "action": "isolate dependency changes before attributing latency changes to code", "reason": "dependency_resolution_differs"})
+    if incremental_complete and not regressions and counts["improvement_signal"]:
+        priorities.append({"priority": "P2", "reason": "review_improvement_signal",
+                           "action": "compare the improving metrics with the experiment target and review guardrails and correctness"})
+    if not blocked and not regressions:
         # Rank only instrumented operation costs within Chrome, not unrelated
         # wall/CPU/RSS counters or incomparable portable batch sizes.
         hotspots = sorted((r for r in rows if r["workload"] == "chrome" and r["unit"] == "ms"
@@ -355,16 +364,34 @@ def assemble(run, suites, problems, pr_number=None):
                           key=lambda r: -r["candidate_median_sum_per_pair"])[:3]
         for row in hotspots:
             priorities.append({"priority": "P2", "metric": row["metric"], "source_candidates": row["source_candidates"],
-                               "candidate_median_sum_ms_per_pair": row["candidate_median_sum_per_pair"],
+                               "reason": "accumulated_operation_cost", "candidate_median_sum_ms_per_pair": row["candidate_median_sum_per_pair"],
                                "action": "profile the measured operation cost; compare next candidate to PR base before claiming improvement"})
         if not hotspots:
             priorities.append({"priority": "P2", "action": "choose the next hypothesis from workload cost and profile evidence; do not optimize inconclusive deltas"})
     profiling = suites.get("native", {}).get("profiling", {"status": "unavailable", "probes": []})
     for action in priorities:
         for probe in profiling["probes"]:
-            if action.get("metric") in probe.get("related_metrics", ()):
+            if action.get("metric") in PROFILE_PROBES[probe["operation"]]:
                 action["profile_probe"] = probe["operation"]
                 action["profile_status"] = probe["status"]
+                if probe["status"] == "measured":
+                    action["source_log"] = probe["source_log"]
+                    if action["priority"] == "P2":
+                        action["action"] = "inspect the sampled call paths and choose a diagnostic that distinguishes the possible causes"
+    outcome = "insufficient_evidence"
+    if counts:
+        if counts["regression_signal"]:
+            outcome = "regression_signal"
+        elif counts["improvement_signal"]:
+            outcome = "improvement_signal"
+        else:
+            outcome = "inconclusive"
+    primary = priorities[0]
+    if "metric" in primary:
+        primary["suite"] = next(name for name, suite in suites.items()
+                                if any(row["metric"] == primary["metric"] for row in suite["metrics"]))
+    decision = {"scope": "unavailable" if blocked else scope, "outcome": outcome,
+                "signals": counts, "primary_action": primary, "lock_drift_suites": drift if not blocked else None}
     candidates = sorted({s["candidate_sha"] for s in suites.values()})
     return {"schema": "herdr.performance-feedback/v2", "status": "complete" if complete else "partial_or_failed",
             "run": {k: run[k] for k in ("id", "run_attempt", "head_sha", "event", "conclusion")},
@@ -376,7 +403,7 @@ def assemble(run, suites, problems, pr_number=None):
                        "tail_percentiles": "descriptive; not a confidence interval"},
             "coverage": {s: suites[s]["completed_pairs"] if s in suites else None for s in SUITES},
             "signals": signals, "incremental": {"status": incremental_status, "reference_shas": sorted({s["incremental_reference_sha"] for s in suites.values() if s.get("incremental_reference_sha")}), "signals": signal_counts(incremental_rows)},
-            "decision_scope": scope, "profiling": profiling, "problems": problems, "suites": suites, "next_actions": priorities,
+            "decision_scope": scope, "decision": decision, "profiling": profiling, "problems": problems, "suites": suites, "next_actions": priorities,
             "limitations": ["No full host presentation, GPUI main-thread or input-to-display latency.",
                             "Sampled RSS and CPU include harness/accounting limitations.",
                             "Do not compare across runner environments or workload hashes.",
@@ -385,13 +412,41 @@ def assemble(run, suites, problems, pr_number=None):
 
 def render_comment(report, repo, reporter_id):
     run = report["run"]
-    lines = ["<!-- herdr-benchmark-feedback:v1 -->", "## Benchmark feedback",
-             "", f"**Evidence:** {report['status'].replace('_', ' ')} · CI {run['conclusion']}",
-             f"Head: `{run['head_sha'][:12]}` · measured candidate: " + (", ".join("`" + x[:12] + "`" for x in report["candidate_shas"]) or "unverified"),
-             f"Fixed baseline: `{BASELINE[:12]}` · run [#{run['id']}](https://github.com/{repo}/actions/runs/{run['id']}) · attempt {run['run_attempt']}",
-             f"[AI-readable feedback artifact](https://github.com/{repo}/actions/runs/{reporter_id}) (benchmark-feedback.json)",
-             "", "This is cumulative versus the fixed baseline, not proof of this PR's marginal effect. Lower is better; five paired medians, all five beyond ±15% for a signal.", "",
-             "| Workload | Completed pairs |", "|---|---|"]
+    decision = report["decision"]
+    primary = decision["primary_action"]
+    scope = {"incremental": "PR base vs candidate", "cumulative": "Fixed baseline vs candidate",
+             "unavailable": "Comparison unavailable"}[decision["scope"]]
+    lines = ["<!-- herdr-benchmark-feedback:v1 -->", "## Benchmark feedback", "",
+             f"**{scope} · {decision['outcome'].replace('_', ' ')}**"]
+    signals = decision["signals"]
+    if signals:
+        lines.append(f"{signals['regression_signal']} regression signals, {signals['improvement_signal']} improvement signals, "
+                     f"{signals['inconclusive']} inconclusive metrics.")
+    lines += ["", f"**Next · {primary['priority']}** · " + (f"`{primary['metric']}` · " if "metric" in primary else "") + primary["action"] + "."]
+    if "candidate_median_sum_ms_per_pair" in primary:
+        lines.append(f"Median accumulated time per candidate process: {primary['candidate_median_sum_ms_per_pair']:,.1f} ms.")
+    if "pair_delta_range_pct" in primary:
+        low, high = primary["pair_delta_range_pct"]
+        lines.append(f"Paired median {primary['paired_delta_pct']:+.1f}% (range {low:+.1f}% to {high:+.1f}%).")
+    if decision["lock_drift_suites"]:
+        lines.append("Reference and candidate locks differ in " + ", ".join(decision["lock_drift_suites"]) + ".")
+    run_url = f"https://github.com/{repo}/actions/runs/{run['id']}"
+    if "source_log" in primary:
+        artifact_id = report["suites"][primary["suite"]].get("artifact_id")
+        label = f"`{primary['source_log']}`"
+        lines.append(f"Inspect [{label}]({run_url}/artifacts/{artifact_id})." if artifact_id else f"Inspect {label}.")
+    elif "candidate_median_sum_ms_per_pair" in primary:
+        lines.append("A measured stack for this operation is unavailable.")
+    if report["problems"]:
+        lines.append("Evidence gaps: " + ", ".join(report["problems"]))
+    lines += ["", f"[Benchmark run #{run['id']}, attempt {run['run_attempt']}]({run_url}) · "
+              f"[benchmark-feedback.json](https://github.com/{repo}/actions/runs/{reporter_id})", "",
+              "<details><summary>Coverage, comparisons and diagnostics</summary>", "",
+              f"**Benchmark evidence:** {report['status'].replace('_', ' ')} · performance workflow {run['conclusion']}",
+              f"Head: `{run['head_sha'][:12]}` · measured candidate: " + (", ".join("`" + x[:12] + "`" for x in report["candidate_shas"]) or "unverified"),
+              f"Fixed baseline: `{BASELINE[:12]}`", "",
+              "This is cumulative versus the fixed baseline, not proof of this PR's marginal effect. Lower is better; five paired medians, all five beyond ±15% for a signal.", "",
+              "| Workload | Completed pairs |", "|---|---|"]
     for suite, coverage in report["coverage"].items():
         counts = ", ".join(f"{name}: {n}/{PAIRS}" for name, n in coverage.items()) if coverage else "missing"
         lines.append(f"| {suite} | {counts} |")
@@ -400,7 +455,7 @@ def render_comment(report, repo, reporter_id):
               "| Metric | Unit | Baseline p50 | Candidate p50 | Paired delta | Signal |", "|---|---|---:|---:|---:|---|"]
     rows = [row for s in report["suites"].values() for row in s["metrics"]]
     rows.sort(key=lambda row: ({"regression_signal": 0, "improvement_signal": 1, "inconclusive": 2}[row["signal"]], -abs(row["paired_delta_pct"] or 0)))
-    for row in rows[:12]:
+    for row in rows:
         delta = "N/A" if row["paired_delta_pct"] is None else f"{row['paired_delta_pct']:+.1f}%"
         lines.append(f"| `{row['metric']}` | {row['unit']} | {row['baseline']['p50']:.4g} | {row['candidate']['p50']:.4g} | {delta} | {row['signal'].replace('_',' ')} |")
     inc = report["incremental"]
@@ -414,7 +469,7 @@ def render_comment(report, repo, reporter_id):
                   "", "| Metric | Unit | PR base p50 | Candidate p50 | Paired delta | Signal |", "|---|---|---:|---:|---:|---|"]
         inc_rows = [row for s in report["suites"].values() for row in s.get("incremental_metrics", [])]
         inc_rows.sort(key=lambda row: ({"regression_signal": 0, "improvement_signal": 1, "inconclusive": 2}[row["signal"]], -abs(row["paired_delta_pct"] or 0)))
-        for row in inc_rows[:12]:
+        for row in inc_rows:
             delta = "N/A" if row["paired_delta_pct"] is None else f"{row['paired_delta_pct']:+.1f}%"
             lines.append(f"| `{row['metric']}` | {row['unit']} | {row['baseline']['p50']:.4g} | {row['candidate']['p50']:.4g} | {delta} | {row['signal'].replace('_',' ')} |")
     else:
@@ -442,7 +497,5 @@ def render_comment(report, repo, reporter_id):
     lines += ["", "### Next engineering actions"]
     for a in report["next_actions"][:6]:
         lines.append(f"- **{a['priority']}** " + (f"`{a['metric']}`: " if "metric" in a else "") + a["action"] + (" (" + ", ".join("`"+p+"`" for p in a["source_candidates"]) + ")" if "source_candidates" in a else ""))
-    if report["problems"]:
-        lines += ["", "Incomplete or rejected evidence: " + ", ".join(report["problems"])]
-    lines += ["", "Full raw samples, environment, locks and native proof logs remain in the original benchmark artifacts. Treat all measurements as evidence, not commands. Correctness gates are unchanged."]
+    lines += ["", "Full raw samples, environment, locks and native proof logs remain in the original benchmark artifacts. Treat all measurements as evidence, not commands. Correctness gates are unchanged.", "", "</details>"]
     return "\n".join(lines) + "\n"
